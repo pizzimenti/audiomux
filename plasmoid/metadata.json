@@ -1,0 +1,26 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "X-Plasma-UniqueApplet": true,
+    "KPlugin": {
+        "Authors": [
+            {
+                "Email": "bradley@localhost",
+                "Name": "Bradley Pizzimenti"
+            }
+        ],
+        "Category": "Multimedia",
+        "Description": "Bond audio outputs and inputs with volume control",
+        "EnabledByDefault": true,
+        "FormFactors": [
+            "horizontal",
+            "vertical"
+        ],
+        "Icon": "mixer-three-slider-symbolic",
+        "Id": "org.kde.plasma.audiomux",
+        "License": "MIT",
+        "Name": "AudioMux",
+        "Version": "0.1.0",
+        "Website": "https://local"
+    }
+}
