@@ -21,6 +21,9 @@ PlasmoidItem {
     property var reconnectSinkNames: []
     property var reconnectSourceNames: []
     property var diagnostics: ({})
+    property var pendingSinkOffsets: ({})
+    property var pendingSourceOffsets: ({})
+    readonly property int pendingOffsetTimeoutMs: 3000
 
     property var sinks: []
     property var sources: []
@@ -45,11 +48,43 @@ PlasmoidItem {
         cmdSource.connectSource(cmd)
     }
 
+    function reconcileOffsets(devices, pendingOffsets) {
+        const now = Date.now()
+        const nextPending = Object.assign({}, pendingOffsets)
+        const nextDevices = devices.map(device => {
+            const pending = nextPending[device.name]
+            if (!pending)
+                return device
+            if (device.offset === pending.value || now - pending.updatedAt > root.pendingOffsetTimeoutMs) {
+                delete nextPending[device.name]
+                return device
+            }
+            return Object.assign({}, device, { offset: pending.value })
+        })
+        return { devices: nextDevices, pendingOffsets: nextPending }
+    }
+
+    function setPendingOffset(devices, pendingOffsets, name, offset) {
+        const nextPending = Object.assign({}, pendingOffsets)
+        nextPending[name] = {
+            value: offset,
+            updatedAt: Date.now()
+        }
+        const nextDevices = devices.map(device => device.name === name
+            ? Object.assign({}, device, { offset: offset })
+            : device)
+        return { devices: nextDevices, pendingOffsets: nextPending }
+    }
+
     function parseState(json) {
         try {
             const s = JSON.parse(json)
-            root.sinks   = s.sinks   || []
-            root.sources = s.sources || []
+            const sinkState = reconcileOffsets(s.sinks || [], root.pendingSinkOffsets)
+            const sourceState = reconcileOffsets(s.sources || [], root.pendingSourceOffsets)
+            root.sinks = sinkState.devices
+            root.sources = sourceState.devices
+            root.pendingSinkOffsets = sinkState.pendingOffsets
+            root.pendingSourceOffsets = sourceState.pendingOffsets
             root.diagnostics = s.diagnostics || {}
         } catch(e) {}
     }
@@ -69,10 +104,16 @@ PlasmoidItem {
     }
 
     function onSinkOffset(name, offset) {
+        const sinkState = setPendingOffset(root.sinks, root.pendingSinkOffsets, name, offset)
+        root.sinks = sinkState.devices
+        root.pendingSinkOffsets = sinkState.pendingOffsets
         runCmd(root.sourceCmd + " set-sink-offset " + name + " " + offset)
     }
 
     function onSourceOffset(name, offset) {
+        const sourceState = setPendingOffset(root.sources, root.pendingSourceOffsets, name, offset)
+        root.sources = sourceState.devices
+        root.pendingSourceOffsets = sourceState.pendingOffsets
         runCmd(root.sourceCmd + " set-source-offset " + name + " " + offset)
     }
 
