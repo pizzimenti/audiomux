@@ -42,6 +42,16 @@ plasmoid/
 ./install.sh
 ```
 
+If you are doing a normal user-local plasmoid update and the helper scripts are
+already present in `/usr/local/libexec/audiomux`, running it as your user is
+fine. If you need to install or replace the system helper scripts, run it via
+`pkexec` so the helpers go to `/usr/local/libexec/audiomux` while the plasmoid
+and icon still install into the real desktop user's home:
+
+```bash
+pkexec env SUDO_USER="$USER" ./install.sh
+```
+
 Then right-click the panel → Add Widgets → search "AudioMux" and add it.
 
 On subsequent updates, re-run `./install.sh` (or `../update-all.sh`) and restart plasmashell.
@@ -74,3 +84,6 @@ python3 bin/audiomux-measure.py
 ```
 
 It records 2 seconds from both output monitors simultaneously, downsamples, and cross-correlates to find the lag in ms. Adjust the offset buttons in the applet until the two outputs align.
+
+The repo keeps its source helpers in `bin/`, but the installed runtime copies
+live in `/usr/local/libexec/audiomux`; AudioMux no longer depends on `~/bin`.
