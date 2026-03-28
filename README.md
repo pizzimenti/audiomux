@@ -57,13 +57,13 @@ PRIMARY_SOURCE = "alsa_input.pci-0000_03_00.6.analog-stereo"
 
 Find your device names with `pactl list sinks short` and `pactl list sources short`.
 
-The plasmoid's `sourceCmd` path in `plasmoid/contents/ui/main.qml` is also hardcoded:
+The plasmoid backend is installed to `/usr/local/libexec/audiomux/audiomux-source.py`, and the QML points at that system path:
 
 ```qml
-readonly property string sourceCmd: "/home/bradley/bin/audiomux-source.py"
+readonly property string sourceCmd: "/usr/local/libexec/audiomux/audiomux-source.py"
 ```
 
-Update both if installing on a different machine or user account.
+If you want a different prefix, update both `install.sh` and `plasmoid/contents/ui/main.qml`.
 
 ## Measuring output lag
 

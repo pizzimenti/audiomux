@@ -19,7 +19,7 @@ Sink routing:
   and applied when the loopback is (re)created.
 """
 
-import sys, os, json, subprocess
+import sys, os, json, subprocess, time, fcntl
 import pulsectl
 
 PRIMARY_SINK        = "alsa_output.pci-0000_03_00.6.analog-stereo"
@@ -27,6 +27,7 @@ PRIMARY_SOURCE      = "alsa_input.pci-0000_03_00.6.analog-stereo"
 VIRTUAL_SINK_NAME   = "audiomux_virtual"
 COMBINE_SOURCE_NAME = "audiomux_combined_source"
 STATE_FILE          = f"/run/user/{os.getuid()}/audiomux.json"
+LOCK_FILE           = f"/run/user/{os.getuid()}/audiomux.lock"
 OFFSETS_FILE        = os.path.expanduser("~/.config/audiomux-offsets.json")
 
 BASE_LATENCY_MS = 200   # loopback buffer before per-device offset
@@ -69,6 +70,17 @@ def save_state(state):
         json.dump(state, f)
 
 
+class _StateLock:
+    def __enter__(self):
+        self._fh = open(LOCK_FILE, "w")
+        fcntl.flock(self._fh, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        fcntl.flock(self._fh, fcntl.LOCK_UN)
+        self._fh.close()
+
+
 # ── pactl wrapper ─────────────────────────────────────────────────────────────
 
 def pactl(*args):
@@ -77,22 +89,160 @@ def pactl(*args):
     return result.stdout.strip()
 
 
+def _service_property(service_name, property_name):
+    result = subprocess.run(
+        ["systemctl", "--user", "show", service_name, f"-p{property_name}"],
+        capture_output=True, text=True)
+    if result.returncode != 0:
+        return ""
+    prefix = f"{property_name}="
+    for line in result.stdout.splitlines():
+        if line.startswith(prefix):
+            return line[len(prefix):]
+    return ""
+
+
 # ── queries ───────────────────────────────────────────────────────────────────
 
-def _live_loopback_sinks():
-    """Return set of sink names that currently have an audiomux loopback module."""
+def _live_loopback_modules():
+    """Return mapping of sink names to live audiomux loopback module ids."""
     result = subprocess.run(["pactl", "list", "modules", "short"],
                             capture_output=True, text=True)
-    sinks = set()
+    modules = {}
     for line in result.stdout.splitlines():
         if "module-loopback" not in line:
             continue
         if f"source={VIRTUAL_SINK_NAME}.monitor" not in line:
             continue
+        parts = line.split()
+        if not parts:
+            continue
+        module_id = parts[0]
+        if not module_id.isdigit():
+            continue
         for part in line.split():
             if part.startswith("sink="):
-                sinks.add(part[5:])
-    return sinks
+                modules[part[5:]] = int(module_id)
+    return modules
+
+
+def _live_loopback_sinks():
+    """Return set of sink names that currently have an audiomux loopback module."""
+    return set(_live_loopback_modules())
+
+
+def _has_virtual_sink():
+    result = subprocess.run(["pactl", "list", "sinks", "short"],
+                            capture_output=True, text=True)
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) > 1 and parts[1] == VIRTUAL_SINK_NAME:
+            return True
+    return False
+
+
+def _live_virtual_sink_module_id():
+    result = subprocess.run(["pactl", "list", "modules", "short"],
+                            capture_output=True, text=True)
+    for line in result.stdout.splitlines():
+        if "module-null-sink" not in line:
+            continue
+        if f"sink_name={VIRTUAL_SINK_NAME}" not in line:
+            continue
+        parts = line.split()
+        if parts and parts[0].isdigit():
+            return int(parts[0])
+    return None
+
+
+def _preferred_name(primary_name, available_names, fallback_name=None):
+    if primary_name in available_names:
+        return primary_name
+    if fallback_name in available_names:
+        return fallback_name
+    return next(iter(available_names), None)
+
+
+def _reconcile_state(state, sink_names, source_names, default_sink_name,
+                     default_source_name):
+    changed = False
+    stale_sinks_removed = False
+
+    loopback_modules = state.setdefault("loopback_modules", {})
+    live_loopbacks = _live_loopback_modules()
+
+    for sink_name, mid in list(live_loopbacks.items()):
+        if sink_name in sink_names:
+            continue
+        pactl("unload-module", mid)
+        live_loopbacks.pop(sink_name, None)
+        loopback_modules.pop(sink_name, None)
+        changed = True
+        stale_sinks_removed = True
+
+    for sink_name in list(loopback_modules):
+        if sink_name in sink_names:
+            continue
+        mid = loopback_modules.pop(sink_name, None)
+        if mid is not None:
+            pactl("unload-module", mid)
+        changed = True
+        stale_sinks_removed = True
+
+    synced_loopbacks = {
+        sink_name: mid for sink_name, mid in live_loopbacks.items()
+        if sink_name in sink_names
+    }
+    if synced_loopbacks != loopback_modules:
+        state["loopback_modules"] = synced_loopbacks
+        loopback_modules = synced_loopbacks
+        changed = True
+
+    active_sinks = [
+        name for name in (state.get("active_sinks") or []) if name in sink_names
+    ]
+    if not active_sinks:
+        fallback_sink = _preferred_name(PRIMARY_SINK, sink_names, default_sink_name)
+        active_sinks = [fallback_sink] if fallback_sink else []
+    if active_sinks != (state.get("active_sinks") or []):
+        state["active_sinks"] = active_sinks
+        changed = True
+
+    active_sources = [
+        name for name in (state.get("active_sources") or []) if name in source_names
+    ]
+    if not active_sources:
+        fallback_source = _preferred_name(
+            PRIMARY_SOURCE, source_names, default_source_name)
+        active_sources = [fallback_source] if fallback_source else []
+    if active_sources != (state.get("active_sources") or []):
+        state["active_sources"] = active_sources
+        changed = True
+
+    # If the system default moved away from AudioMux, collapse the saved group
+    # to the real default and tear down stale loopbacks so UI and graph match.
+    if default_sink_name != VIRTUAL_SINK_NAME:
+        desired_sinks = [default_sink_name] if default_sink_name in sink_names else []
+        if desired_sinks != (state.get("active_sinks") or []):
+            state["active_sinks"] = desired_sinks
+            changed = True
+
+        for sink_name in list(loopback_modules):
+            mid = loopback_modules.pop(sink_name, None)
+            if mid is not None:
+                pactl("unload-module", mid)
+                stale_sinks_removed = True
+                changed = True
+
+        if state.get("virtual_sink_module_id") is not None and _has_virtual_sink():
+            pactl("unload-module", state["virtual_sink_module_id"])
+            state["virtual_sink_module_id"] = None
+            changed = True
+
+    if changed:
+        save_state(state)
+
+    return stale_sinks_removed
 
 
 def get_state():
@@ -101,27 +251,48 @@ def get_state():
 
     with pulsectl.Pulse("audiomux-source") as pulse:
         server = pulse.server_info()
+        sink_list = pulse.sink_list()
+        source_list = pulse.source_list()
+        sink_names = {
+            sink.name for sink in sink_list
+            if sink.name != VIRTUAL_SINK_NAME and "monitor" not in sink.name
+        }
+        source_names = {
+            source.name for source in source_list
+            if source.name != COMBINE_SOURCE_NAME and "monitor" not in source.name
+        }
 
-        has_virtual = any(s.name == VIRTUAL_SINK_NAME for s in pulse.sink_list())
+        stale_sinks_removed = _reconcile_state(
+            saved, sink_names, source_names, server.default_sink_name,
+            server.default_source_name)
+        if stale_sinks_removed and server.default_sink_name == VIRTUAL_SINK_NAME:
+            set_active_sinks(saved.get("active_sinks") or [], force_rebuild=True)
+            saved = load_state()
+
+        has_virtual = any(s.name == VIRTUAL_SINK_NAME for s in sink_list)
 
         if has_virtual and server.default_sink_name == VIRTUAL_SINK_NAME:
             # Virtual sink is active — ground truth is the live loopbacks
-            active_sink_names = _live_loopback_sinks()
+            active_sink_names = _live_loopback_sinks() & sink_names
             if not active_sink_names:
-                active_sink_names = {PRIMARY_SINK}
+                for sink_name in saved.get("active_sinks") or []:
+                    _add_loopback(saved, sink_name)
+                if saved.get("active_sinks"):
+                    save_state(saved)
+                active_sink_names = set(saved.get("active_sinks") or [])
         else:
             # Virtual sink is stale or bypassed — trust the current default sink
             active_sink_names = {server.default_sink_name}
 
         has_combine_source = any(
-            s.name == COMBINE_SOURCE_NAME for s in pulse.source_list())
+            s.name == COMBINE_SOURCE_NAME for s in source_list)
         if has_combine_source and saved.get("active_sources"):
-            active_source_names = set(saved["active_sources"])
+            active_source_names = set(saved["active_sources"]) & source_names
         else:
             active_source_names = {server.default_source_name}
 
         sinks = []
-        for sink in pulse.sink_list():
+        for sink in sink_list:
             if sink.name in (VIRTUAL_SINK_NAME,) or "monitor" in sink.name:
                 continue
             sinks.append({
@@ -134,7 +305,7 @@ def get_state():
             })
 
         sources = []
-        for source in pulse.source_list():
+        for source in source_list:
             if source.name in (COMBINE_SOURCE_NAME,) or "monitor" in source.name:
                 continue
             sources.append({
@@ -146,19 +317,35 @@ def get_state():
                 "offset":      offsets.get(source.name, 0),
             })
 
-    return {"sinks": sinks, "sources": sources}
+    wireplumber_restarts = _service_property("wireplumber.service", "NRestarts")
+    wireplumber_active_at = _service_property(
+        "wireplumber.service", "ActiveEnterTimestamp")
+
+    diagnostics = {
+        "wireplumber_restarts": int(wireplumber_restarts or "0"),
+        "wireplumber_active_at": wireplumber_active_at,
+    }
+
+    return {"sinks": sinks, "sources": sources, "diagnostics": diagnostics}
 
 
 # ── sink routing (virtual + loopbacks) ────────────────────────────────────────
 
 def _ensure_virtual_sink(state):
+    live_mid = _live_virtual_sink_module_id()
+    if live_mid is None or not _has_virtual_sink():
+        state["virtual_sink_module_id"] = None
+    else:
+        state["virtual_sink_module_id"] = live_mid
+
     if state.get("virtual_sink_module_id") is None:
         mid = pactl("load-module", "module-null-sink",
                     f"sink_name={VIRTUAL_SINK_NAME}",
                     "sink_properties=device.description=AudioMux")
         if mid.isdigit():
             state["virtual_sink_module_id"] = int(mid)
-            pactl("set-default-sink", VIRTUAL_SINK_NAME)
+    if _has_virtual_sink():
+        pactl("set-default-sink", VIRTUAL_SINK_NAME)
 
 
 def _add_loopback(state, sink_name):
@@ -178,9 +365,21 @@ def _remove_loopback(state, sink_name):
         pactl("unload-module", mid)
 
 
-def set_active_sinks(names):
-    if not names:
-        names = [PRIMARY_SINK]
+def _set_mute(name, muted):
+    pactl("set-sink-mute", name, 1 if muted else 0)
+
+
+def set_active_sinks(names, force_rebuild=False):
+    with pulsectl.Pulse("audiomux-set-sinks") as pulse:
+        sink_names = {
+            sink.name for sink in pulse.sink_list()
+            if sink.name != VIRTUAL_SINK_NAME and "monitor" not in sink.name
+        }
+        names = [name for name in names if name in sink_names]
+        if not names:
+            fallback = _preferred_name(
+                PRIMARY_SINK, sink_names, pulse.server_info().default_sink_name)
+            names = [fallback] if fallback else []
 
     state = load_state()
     current_loopbacks = set(state.get("loopback_modules", {}).keys())
@@ -188,11 +387,21 @@ def set_active_sinks(names):
 
     _ensure_virtual_sink(state)
 
+    if force_rebuild and current_loopbacks:
+        for sink_name in list(current_loopbacks):
+            _remove_loopback(state, sink_name)
+        current_loopbacks = set()
+
     for sink_name in current_loopbacks - names_set:
         _remove_loopback(state, sink_name)
 
     for sink_name in names_set - current_loopbacks:
         _add_loopback(state, sink_name)
+
+    if force_rebuild:
+        _set_mute(VIRTUAL_SINK_NAME, False)
+        for sink_name in names_set:
+            _set_mute(sink_name, False)
 
     state["active_sinks"] = list(names_set)
     save_state(state)
@@ -213,8 +422,16 @@ def set_sink_offset(name, offset_ms):
 # ── source routing (combine) ──────────────────────────────────────────────────
 
 def set_active_sources(names):
-    if not names:
-        names = [PRIMARY_SOURCE]
+    with pulsectl.Pulse("audiomux-set-sources") as pulse:
+        source_names = {
+            source.name for source in pulse.source_list()
+            if source.name != COMBINE_SOURCE_NAME and "monitor" not in source.name
+        }
+        names = [name for name in names if name in source_names]
+        if not names:
+            fallback = _preferred_name(
+                PRIMARY_SOURCE, source_names, pulse.server_info().default_source_name)
+            names = [fallback] if fallback else []
 
     state = load_state()
     if state.get("source_module_id") is not None:
@@ -242,6 +459,23 @@ def set_source_offset(name, offset_ms):
     save_offsets(offsets)
 
 
+def reconnect_all():
+    with _StateLock():
+        state = load_state()
+        active_sinks = list(state.get("active_sinks") or [])
+        active_sources = list(state.get("active_sources") or [])
+
+        for sink_name in list(state.get("loopback_modules", {})):
+            _remove_loopback(state, sink_name)
+        save_state(state)
+
+        # Give PipeWire a moment to drop the old loopback graph before rebuilding.
+        time.sleep(0.35)
+
+        set_active_sinks(active_sinks, force_rebuild=True)
+        set_active_sources(active_sources)
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -262,6 +496,8 @@ def main():
     elif action == "unbond-all":
         set_active_sinks([PRIMARY_SINK])
         set_active_sources([PRIMARY_SOURCE])
+    elif action == "reconnect-all":
+        reconnect_all()
     elif action == "set-sink-vol" and len(args) >= 3:
         pactl("set-sink-volume", args[1], f"{args[2]}%")
     elif action == "set-source-vol" and len(args) >= 3:
