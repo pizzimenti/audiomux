@@ -47,7 +47,17 @@ user_run kbuildsycoca6 2>/dev/null || true
 # ── plasmoid ──────────────────────────────────────────────────────────────────
 
 log "Installing plasmoid $PLASMOID_ID"
-if user_run kpackagetool6 --type Plasma/Applet --show "$PLASMOID_ID" &>/dev/null; then
+
+# If the user install location is a symlink (e.g. a dev symlink into the source
+# repo), remove the symlink itself before invoking kpackagetool6. Otherwise
+# `kpackagetool6 --upgrade` follows the symlink and rm -rf's the source.
+USER_PLASMOID_DIR="$TARGET_HOME/.local/share/plasma/plasmoids/$PLASMOID_ID"
+if [[ -L "$USER_PLASMOID_DIR" ]]; then
+    log "Removing dev symlink $USER_PLASMOID_DIR -> $(readlink "$USER_PLASMOID_DIR")"
+    user_run rm -f -- "$USER_PLASMOID_DIR"
+fi
+
+if [[ -d "$USER_PLASMOID_DIR" ]]; then
     user_run kpackagetool6 --type Plasma/Applet --upgrade "$SCRIPT_DIR/plasmoid"
 else
     user_run kpackagetool6 --type Plasma/Applet --install "$SCRIPT_DIR/plasmoid"
