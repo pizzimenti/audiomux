@@ -2,8 +2,20 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PLASMOID_ID="org.kde.plasma.audiomux"
 LIBEXEC_DIR="/usr/local/libexec/audiomux"
+
+# Extract plasmoid id from metadata.json so this script can't drift from the
+# packaged plasmoid. python3 is already a hard dep of audiomux (the helpers
+# in bin/ are Python), so no extra tooling is required.
+PLASMOID_METADATA="$SCRIPT_DIR/plasmoid/metadata.json"
+PLASMOID_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["KPlugin"]["Id"])' "$PLASMOID_METADATA" 2>/dev/null)" || {
+    printf 'Unable to read KPlugin.Id from %s\n' "$PLASMOID_METADATA" >&2
+    exit 1
+}
+if [[ -z "$PLASMOID_ID" ]]; then
+    printf 'KPlugin.Id is empty in %s\n' "$PLASMOID_METADATA" >&2
+    exit 1
+fi
 
 log() { printf '==> %s\n' "$*"; }
 
@@ -48,19 +60,31 @@ user_run kbuildsycoca6 2>/dev/null || true
 
 log "Installing plasmoid $PLASMOID_ID"
 
-# If the user install location is a symlink (e.g. a dev symlink into the source
-# repo), remove the symlink itself before invoking kpackagetool6. Otherwise
-# `kpackagetool6 --upgrade` follows the symlink and rm -rf's the source.
+# If a dev symlink at ~/.local/share/plasma/plasmoids/<id> points back at *this*
+# checkout, remove the symlink itself before invoking kpackagetool6. Otherwise
+# `kpackagetool6 --upgrade` follows the symlink and rm -rf's the source repo.
+# Unrelated symlinked installs (e.g. another working tree) are left alone and
+# the script bails out so the user can resolve them manually.
 USER_PLASMOID_DIR="$TARGET_HOME/.local/share/plasma/plasmoids/$PLASMOID_ID"
+PLASMOID_CANONICAL_DIR="$(realpath "$SCRIPT_DIR/plasmoid")"
 if [[ -L "$USER_PLASMOID_DIR" ]]; then
-    log "Removing dev symlink $USER_PLASMOID_DIR -> $(readlink "$USER_PLASMOID_DIR")"
-    user_run rm -f -- "$USER_PLASMOID_DIR"
+    INSTALLED_TARGET="$(realpath "$USER_PLASMOID_DIR")"
+    if [[ "$INSTALLED_TARGET" == "$PLASMOID_CANONICAL_DIR" ]]; then
+        log "Removing dev symlink $USER_PLASMOID_DIR -> $(readlink "$USER_PLASMOID_DIR")"
+        user_run rm -f -- "$USER_PLASMOID_DIR"
+    else
+        printf 'Refusing to remove unrelated symlink %s -> %s\n' \
+            "$USER_PLASMOID_DIR" "$(readlink "$USER_PLASMOID_DIR")" >&2
+        printf 'Resolved target (%s) does not match this checkout (%s).\n' \
+            "$INSTALLED_TARGET" "$PLASMOID_CANONICAL_DIR" >&2
+        exit 1
+    fi
 fi
 
 if [[ -d "$USER_PLASMOID_DIR" ]]; then
-    user_run kpackagetool6 --type Plasma/Applet --upgrade "$SCRIPT_DIR/plasmoid"
+    user_run kpackagetool6 --type Plasma/Applet --upgrade "$PLASMOID_CANONICAL_DIR"
 else
-    user_run kpackagetool6 --type Plasma/Applet --install "$SCRIPT_DIR/plasmoid"
+    user_run kpackagetool6 --type Plasma/Applet --install "$PLASMOID_CANONICAL_DIR"
 fi
 
 # ── python dep ────────────────────────────────────────────────────────────────
