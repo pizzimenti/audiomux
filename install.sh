@@ -68,8 +68,10 @@ log "Installing plasmoid $PLASMOID_ID"
 USER_PLASMOID_DIR="$TARGET_HOME/.local/share/plasma/plasmoids/$PLASMOID_ID"
 PLASMOID_CANONICAL_DIR="$(realpath "$SCRIPT_DIR/plasmoid")"
 if [[ -L "$USER_PLASMOID_DIR" ]]; then
-    INSTALLED_TARGET="$(realpath "$USER_PLASMOID_DIR")"
-    if [[ "$INSTALLED_TARGET" == "$PLASMOID_CANONICAL_DIR" ]]; then
+    if ! INSTALLED_TARGET="$(realpath "$USER_PLASMOID_DIR" 2>/dev/null)"; then
+        log "Removing broken symlink $USER_PLASMOID_DIR -> $(readlink "$USER_PLASMOID_DIR")"
+        user_run rm -f -- "$USER_PLASMOID_DIR"
+    elif [[ "$INSTALLED_TARGET" == "$PLASMOID_CANONICAL_DIR" ]]; then
         log "Removing dev symlink $USER_PLASMOID_DIR -> $(readlink "$USER_PLASMOID_DIR")"
         user_run rm -f -- "$USER_PLASMOID_DIR"
     else
