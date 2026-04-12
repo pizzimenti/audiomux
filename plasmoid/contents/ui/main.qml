@@ -14,8 +14,7 @@ PlasmoidItem {
     id: root
 
     readonly property string sourceCmd: "/usr/local/libexec/audiomux/audiomux-source.py"
-    property int refreshMs: 250
-    property int backgroundRefreshMs: 250
+    property int refreshMs: 1000
     property bool reconnectPending: false
     property bool busy: reconnectPending
     property var reconnectSinkNames: []
@@ -580,10 +579,10 @@ PlasmoidItem {
     }
 
     Timer {
-        interval: root.expanded ? root.refreshMs : root.backgroundRefreshMs
+        interval: root.refreshMs
         repeat: true
-        running: true
-        triggeredOnStart: true
+        running: root.expanded || root.reconnectPending
+        triggeredOnStart: false
         onTriggered: root.pollNow()
     }
 
@@ -601,8 +600,6 @@ PlasmoidItem {
     onExpandedChanged: {
         if (root.expanded) root.pollNow()
     }
-
-    Component.onCompleted: pollNow()
 
     Item {
         id: rootLaserOverlay
