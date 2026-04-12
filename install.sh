@@ -97,4 +97,15 @@ if ! user_run python3 -c "import pulsectl" 2>/dev/null; then
 fi
 
 log "Done — add the AudioMux widget to your panel if this is a fresh install."
-log "Run 'update-all.sh' (or restart plasmashell manually) to reload the applet."
+
+# ── reload plasmashell ───────────────────────────────────────────────────────
+
+if [[ "${SKIP_PLASMA_RELOAD:-0}" == "1" ]]; then
+    log "Skipping plasmashell reload (SKIP_PLASMA_RELOAD=1)"
+else
+    log "Reloading plasmashell"
+    user_run kquitapp6 plasmashell >/dev/null 2>&1 || true
+    sleep 2
+    user_run systemctl --user start plasma-plasmashell.service >/dev/null 2>&1 \
+        || user_run kstart plasmashell
+fi

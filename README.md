@@ -39,22 +39,35 @@ plasmoid/
 ## Installation
 
 ```bash
-./install.sh
+sudo ./install.sh
 ```
 
-If you are doing a normal user-local plasmoid update and the helper scripts are
-already present in `/usr/local/libexec/audiomux`, running it as your user is
-fine. If you need to install or replace the system helper scripts, run it via
-`pkexec` so the helpers go to `/usr/local/libexec/audiomux` while the plasmoid
-and icon still install into the real desktop user's home:
+This installs the helper scripts to `/usr/local/libexec/audiomux`, the plasmoid
+via `kpackagetool6`, the panel icon, and restarts plasmashell automatically.
+
+If the helper scripts are already installed and you only need to update the
+plasmoid, running as your normal user is fine:
 
 ```bash
-pkexec env SUDO_USER="$USER" ./install.sh
+./install.sh
 ```
 
 Then right-click the panel → Add Widgets → search "AudioMux" and add it.
 
-On subsequent updates, re-run `./install.sh` (or `../update-all.sh`) and restart plasmashell.
+To skip the plasmashell restart (e.g. when called from a batch updater):
+
+```bash
+SKIP_PLASMA_RELOAD=1 sudo ./install.sh
+```
+
+## Uninstallation
+
+```bash
+sudo ./uninstall.sh
+```
+
+Removes the plasmoid, icon, helper scripts, and offset config, then restarts
+plasmashell.
 
 ## Machine-specific configuration
 
@@ -86,4 +99,4 @@ python3 bin/audiomux-measure.py
 It records 2 seconds from both output monitors simultaneously, downsamples, and cross-correlates to find the lag in ms. Adjust the offset buttons in the applet until the two outputs align.
 
 The repo keeps its source helpers in `bin/`, but the installed runtime copies
-live in `/usr/local/libexec/audiomux`; AudioMux no longer depends on `~/bin`.
+live in `/usr/local/libexec/audiomux`.

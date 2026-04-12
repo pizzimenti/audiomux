@@ -128,12 +128,11 @@ PlasmoidItem {
 
     // ── compact: icon ─────────────────────────────────────────────────────
 
-    compactRepresentation: Kirigami.Icon {
-        source: "mixer-three-slider-symbolic"
-        isMask: true
-        active: root.expanded
-        implicitWidth: Kirigami.Units.iconSizes.smallMedium
-        implicitHeight: Kirigami.Units.iconSizes.smallMedium
+    compactRepresentation: Text {
+        text: "\u{1F39B}\u{FE0F}"
+        font.pixelSize: Kirigami.Units.iconSizes.smallMedium
+        horizontalAlignment: Text.AlignHCenter
+        verticalAlignment: Text.AlignVCenter
 
         TapHandler {
             onTapped: root.expanded = !root.expanded
@@ -156,11 +155,9 @@ PlasmoidItem {
                 RowLayout {
                     Layout.fillWidth: true
 
-                    Kirigami.Icon {
-                        source: "mixer-three-slider-symbolic"
-                        isMask: true
-                        implicitWidth: Kirigami.Units.iconSizes.smallMedium
-                        implicitHeight: Kirigami.Units.iconSizes.smallMedium
+                    Text {
+                        text: "\u{1F39B}\u{FE0F}"
+                        font.pixelSize: Kirigami.Units.iconSizes.smallMedium
                     }
 
                     PlasmaExtras.Heading {
