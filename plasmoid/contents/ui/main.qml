@@ -15,10 +15,6 @@ PlasmoidItem {
 
     readonly property string sourceCmd: "/usr/local/libexec/audiomux/audiomux-source.py"
     property int refreshMs: 1000
-    property bool reconnectPending: false
-    property bool busy: reconnectPending
-    property var reconnectSinkNames: []
-    property var reconnectSourceNames: []
     property var diagnostics: ({})
     property var pendingSinkOffsets: ({})
     property var pendingSourceOffsets: ({})
@@ -26,6 +22,9 @@ PlasmoidItem {
 
     property var sinks: []
     property var sources: []
+    property string masterSink: ""
+    property string syncStatus: ""
+    property bool syncChecking: false
 
     preferredRepresentation: compactRepresentation
     Plasmoid.icon: "mixer-three-slider-symbolic"
@@ -85,10 +84,13 @@ PlasmoidItem {
             root.pendingSinkOffsets = sinkState.pendingOffsets
             root.pendingSourceOffsets = sourceState.pendingOffsets
             root.diagnostics = s.diagnostics || {}
+            root.masterSink = s.master_sink || ""
         } catch(e) {}
     }
 
     function onSinkToggled(name, active) {
+        if (active)
+            runCmd(root.sourceCmd + " set-sink-offset " + name + " 0")
         const actives = root.sinks
             .filter(s => s.name === name ? active : s.active)
             .map(s => s.name)
@@ -96,6 +98,8 @@ PlasmoidItem {
     }
 
     function onSourceToggled(name, active) {
+        if (active)
+            runCmd(root.sourceCmd + " set-source-offset " + name + " 0")
         const actives = root.sources
             .filter(s => s.name === name ? active : s.active)
             .map(s => s.name)
@@ -116,16 +120,6 @@ PlasmoidItem {
         runCmd(root.sourceCmd + " set-source-offset " + name + " " + offset)
     }
 
-    function reconnectAll() {
-        if (root.busy)
-            return
-        root.reconnectSinkNames = root.sinks.filter(s => s.active).map(s => s.name)
-        root.reconnectSourceNames = root.sources.filter(s => s.active).map(s => s.name)
-        root.reconnectPending = true
-        reconnectCooldown.restart()
-        runCmd(root.sourceCmd + " reconnect-all")
-    }
-
     // ── compact: icon ─────────────────────────────────────────────────────
 
     compactRepresentation: Text {
@@ -144,6 +138,8 @@ PlasmoidItem {
     fullRepresentation: PlasmaExtras.Representation {
         Layout.minimumWidth:  Kirigami.Units.gridUnit * 28
         Layout.preferredWidth: Kirigami.Units.gridUnit * 28
+        Layout.minimumHeight: Kirigami.Units.gridUnit * 18
+        Layout.preferredHeight: Kirigami.Units.gridUnit * 22
         collapseMarginsHint: true
 
         // ── header bar ────────────────────────────────────────────────────
@@ -168,12 +164,24 @@ PlasmoidItem {
                     }
 
                     PC3.Button {
-                        id: reconnectButton
-                        text: "Reconnect All"
-                        icon.name: "view-refresh-symbolic"
-                        enabled: !root.busy
-                        onClicked: root.reconnectAll()
+                        text: root.syncChecking ? "Syncing…" : "Sync Delay"
+                        icon.name: "chronometer"
+                        enabled: !root.syncChecking && root.sinks.filter(s => s.active).length > 1
+                        onClicked: {
+                            root.syncChecking = true
+                            root.syncStatus = "Playing test tones…"
+                            syncCmdSource.disconnectSource(root.sourceCmd + " check-sync")
+                            syncCmdSource.connectSource(root.sourceCmd + " check-sync")
+                        }
                     }
+                }
+
+                PC3.Label {
+                    Layout.fillWidth: true
+                    visible: root.syncStatus !== ""
+                    text: root.syncStatus
+                    font.pointSize: Kirigami.Theme.smallFont.pointSize
+                    wrapMode: Text.Wrap
                 }
 
                 PC3.Label {
@@ -181,7 +189,7 @@ PlasmoidItem {
                     visible: (root.diagnostics.wireplumber_restarts || 0) > 0
                     text: "WirePlumber restarted at "
                         + (root.diagnostics.wireplumber_active_at || "unknown time")
-                    color: "#ff8a65"
+                    color: Kirigami.Theme.neutralTextColor
                     font.pointSize: Kirigami.Theme.smallFont.pointSize
                     wrapMode: Text.Wrap
                 }
@@ -218,102 +226,17 @@ PlasmoidItem {
                 model: root.sinks
                 delegate: RowLayout {
                     required property var modelData
-                    readonly property bool reconnectTarget: root.reconnectPending
-                        && root.reconnectSinkNames.indexOf(modelData.name) !== -1
                     Layout.fillWidth: true
                     Layout.leftMargin: Kirigami.Units.largeSpacing
                     Layout.rightMargin: Kirigami.Units.largeSpacing
                     Layout.topMargin: Kirigami.Units.smallSpacing
                     Layout.bottomMargin: Kirigami.Units.smallSpacing
                     spacing: Kirigami.Units.smallSpacing
-                    opacity: reconnectTarget ? 0.45 : 1
 
-                    Item {
-                        implicitWidth: sinkCheck.implicitWidth
-                        implicitHeight: sinkCheck.implicitHeight
-
-                        PC3.CheckBox {
-                            id: sinkCheck
-                            anchors.centerIn: parent
-                            checked: modelData.active
-                            enabled: !root.busy
-                                && (!modelData.active || root.sinks.filter(s => s.active).length > 1)
-                            opacity: reconnectTarget ? 0.2 : 1
-                            onToggled: root.onSinkToggled(modelData.name, checked)
-                        }
-
-                        Rectangle {
-                            id: sinkGlow
-                            anchors.centerIn: sinkCheck
-                            width: sinkCheck.width + Kirigami.Units.smallSpacing * 4
-                            height: sinkCheck.height + Kirigami.Units.smallSpacing * 4
-                            radius: width / 2
-                            color: "#ff7a59"
-                            opacity: reconnectTarget ? 0.32 : 0
-                            z: -1
-                        }
-
-                        ParallelAnimation {
-                            running: reconnectTarget
-                            loops: Animation.Infinite
-                            NumberAnimation {
-                                target: sinkCheck
-                                property: "scale"
-                                from: 1
-                                to: 1.16
-                                duration: 140
-                            }
-                            NumberAnimation {
-                                target: sinkCheck
-                                property: "opacity"
-                                from: 0.2
-                                to: 1
-                                duration: 140
-                            }
-                            NumberAnimation {
-                                target: sinkGlow
-                                property: "scale"
-                                from: 0.86
-                                to: 1.28
-                                duration: 180
-                            }
-                            NumberAnimation {
-                                target: sinkGlow
-                                property: "opacity"
-                                from: 0.1
-                                to: 0.45
-                                duration: 180
-                            }
-                        }
-
-                        Rectangle {
-                            parent: rootLaserOverlay
-                            visible: reconnectTarget && reconnectButton.visible && sinkCheck.visible
-                            color: "#ff5630"
-                            height: 3
-                            radius: 2
-                            antialiasing: true
-                            readonly property point startPoint: reconnectButton.mapToItem(
-                                rootLaserOverlay, reconnectButton.width, reconnectButton.height / 2)
-                            readonly property point endPoint: sinkCheck.mapToItem(
-                                rootLaserOverlay, 0, sinkCheck.height / 2)
-                            readonly property real dx: endPoint.x - startPoint.x
-                            readonly property real dy: endPoint.y - startPoint.y
-                            width: Math.sqrt(dx * dx + dy * dy)
-                            x: startPoint.x
-                            y: startPoint.y - height / 2
-                            transformOrigin: Item.Left
-                            rotation: Math.atan2(dy, dx) * 180 / Math.PI
-                            opacity: reconnectTarget ? 0.9 : 0
-
-                            SequentialAnimation on opacity {
-                                running: reconnectTarget
-                                loops: Animation.Infinite
-                                NumberAnimation { from: 0.15; to: 1; duration: 90 }
-                                NumberAnimation { from: 1; to: 0.35; duration: 120 }
-                                PauseAnimation { duration: 80 }
-                            }
-                        }
+                    PC3.CheckBox {
+                        checked: modelData.active
+                        enabled: !modelData.active || root.sinks.filter(s => s.active).length > 1
+                        onToggled: root.onSinkToggled(modelData.name, checked)
                     }
 
                     PC3.Label {
@@ -322,12 +245,19 @@ PlasmoidItem {
                         elide: Text.ElideRight
                     }
 
+                    PC3.Label {
+                        visible: modelData.role === "master" && modelData.active
+                        text: "master"
+                        font.pointSize: Kirigami.Theme.smallFont.pointSize
+                        color: Kirigami.Theme.disabledTextColor
+                        font.italic: true
+                    }
+
                     PC3.Slider {
                         id: sinkSlider
                         Layout.preferredWidth: Kirigami.Units.gridUnit * 7
                         from: 0; to: 150; stepSize: 1
                         value: modelData.volume
-                        enabled: !root.busy
                         Binding {
                             target: sinkSlider
                             property: "value"
@@ -348,10 +278,10 @@ PlasmoidItem {
                     }
 
                     PC3.Button {
-                        text: "−"
+                        text: "\u2212"
                         implicitWidth: Kirigami.Units.gridUnit * 1.4
-                        enabled: !root.busy
-                        onClicked: root.onSinkOffset(modelData.name, modelData.offset - 10)
+                        enabled: modelData.offset > 0
+                        onClicked: root.onSinkOffset(modelData.name, Math.max(0, modelData.offset - 15))
                     }
 
                     PC3.Label {
@@ -365,8 +295,7 @@ PlasmoidItem {
                     PC3.Button {
                         text: "+"
                         implicitWidth: Kirigami.Units.gridUnit * 1.4
-                        enabled: !root.busy
-                        onClicked: root.onSinkOffset(modelData.name, modelData.offset + 10)
+                        onClicked: root.onSinkOffset(modelData.name, modelData.offset + 15)
                     }
                 }
             }
@@ -395,102 +324,17 @@ PlasmoidItem {
                 model: root.sources
                 delegate: RowLayout {
                     required property var modelData
-                    readonly property bool reconnectTarget: root.reconnectPending
-                        && root.reconnectSourceNames.indexOf(modelData.name) !== -1
                     Layout.fillWidth: true
                     Layout.leftMargin: Kirigami.Units.largeSpacing
                     Layout.rightMargin: Kirigami.Units.largeSpacing
                     Layout.topMargin: Kirigami.Units.smallSpacing
                     Layout.bottomMargin: Kirigami.Units.smallSpacing
                     spacing: Kirigami.Units.smallSpacing
-                    opacity: reconnectTarget ? 0.45 : 1
 
-                    Item {
-                        implicitWidth: sourceCheck.implicitWidth
-                        implicitHeight: sourceCheck.implicitHeight
-
-                        PC3.CheckBox {
-                            id: sourceCheck
-                            anchors.centerIn: parent
-                            checked: modelData.active
-                            enabled: !root.busy
-                                && (!modelData.active || root.sources.filter(s => s.active).length > 1)
-                            opacity: reconnectTarget ? 0.2 : 1
-                            onToggled: root.onSourceToggled(modelData.name, checked)
-                        }
-
-                        Rectangle {
-                            id: sourceGlow
-                            anchors.centerIn: sourceCheck
-                            width: sourceCheck.width + Kirigami.Units.smallSpacing * 4
-                            height: sourceCheck.height + Kirigami.Units.smallSpacing * 4
-                            radius: width / 2
-                            color: "#ff7a59"
-                            opacity: reconnectTarget ? 0.32 : 0
-                            z: -1
-                        }
-
-                        ParallelAnimation {
-                            running: reconnectTarget
-                            loops: Animation.Infinite
-                            NumberAnimation {
-                                target: sourceCheck
-                                property: "scale"
-                                from: 1
-                                to: 1.16
-                                duration: 140
-                            }
-                            NumberAnimation {
-                                target: sourceCheck
-                                property: "opacity"
-                                from: 0.2
-                                to: 1
-                                duration: 140
-                            }
-                            NumberAnimation {
-                                target: sourceGlow
-                                property: "scale"
-                                from: 0.86
-                                to: 1.28
-                                duration: 180
-                            }
-                            NumberAnimation {
-                                target: sourceGlow
-                                property: "opacity"
-                                from: 0.1
-                                to: 0.45
-                                duration: 180
-                            }
-                        }
-
-                        Rectangle {
-                            parent: rootLaserOverlay
-                            visible: reconnectTarget && reconnectButton.visible && sourceCheck.visible
-                            color: "#ff5630"
-                            height: 3
-                            radius: 2
-                            antialiasing: true
-                            readonly property point startPoint: reconnectButton.mapToItem(
-                                rootLaserOverlay, reconnectButton.width, reconnectButton.height / 2)
-                            readonly property point endPoint: sourceCheck.mapToItem(
-                                rootLaserOverlay, 0, sourceCheck.height / 2)
-                            readonly property real dx: endPoint.x - startPoint.x
-                            readonly property real dy: endPoint.y - startPoint.y
-                            width: Math.sqrt(dx * dx + dy * dy)
-                            x: startPoint.x
-                            y: startPoint.y - height / 2
-                            transformOrigin: Item.Left
-                            rotation: Math.atan2(dy, dx) * 180 / Math.PI
-                            opacity: reconnectTarget ? 0.9 : 0
-
-                            SequentialAnimation on opacity {
-                                running: reconnectTarget
-                                loops: Animation.Infinite
-                                NumberAnimation { from: 0.15; to: 1; duration: 90 }
-                                NumberAnimation { from: 1; to: 0.35; duration: 120 }
-                                PauseAnimation { duration: 80 }
-                            }
-                        }
+                    PC3.CheckBox {
+                        checked: modelData.active
+                        enabled: !modelData.active || root.sources.filter(s => s.active).length > 1
+                        onToggled: root.onSourceToggled(modelData.name, checked)
                     }
 
                     PC3.Label {
@@ -504,7 +348,6 @@ PlasmoidItem {
                         Layout.preferredWidth: Kirigami.Units.gridUnit * 7
                         from: 0; to: 150; stepSize: 1
                         value: modelData.volume
-                        enabled: !root.busy
                         Binding {
                             target: sourceSlider
                             property: "value"
@@ -525,10 +368,10 @@ PlasmoidItem {
                     }
 
                     PC3.Button {
-                        text: "−"
+                        text: "\u2212"
                         implicitWidth: Kirigami.Units.gridUnit * 1.4
-                        enabled: !root.busy
-                        onClicked: root.onSourceOffset(modelData.name, modelData.offset - 10)
+                        enabled: modelData.offset > 0
+                        onClicked: root.onSourceOffset(modelData.name, Math.max(0, modelData.offset - 15))
                     }
 
                     PC3.Label {
@@ -542,8 +385,7 @@ PlasmoidItem {
                     PC3.Button {
                         text: "+"
                         implicitWidth: Kirigami.Units.gridUnit * 1.4
-                        enabled: !root.busy
-                        onClicked: root.onSourceOffset(modelData.name, modelData.offset + 10)
+                        onClicked: root.onSourceOffset(modelData.name, modelData.offset + 15)
                     }
                 }
             }
@@ -575,33 +417,65 @@ PlasmoidItem {
         }
     }
 
+    Plasma5Support.DataSource {
+        id: syncCmdSource
+        engine: "executable"
+        interval: 0
+        onNewData: (sourceName, sourceData) => {
+            syncCmdSource.disconnectSource(sourceName)
+            root.syncChecking = false
+            try {
+                const stdout = sourceData.stdout || ""
+                const stderr = sourceData.stderr || ""
+                if (!stdout.trim()) {
+                    root.syncStatus = "No response from daemon" + (stderr ? ": " + stderr.substring(0, 200) : "")
+                    return
+                }
+                const r = JSON.parse(stdout)
+                if (!r.ok) {
+                    root.syncStatus = "Calibration error: " + (r.error || "unknown")
+                    return
+                }
+                let lines = []
+                let applied = 0
+                let issues = 0
+                for (const [sink, data] of Object.entries(r.results || {})) {
+                    const dev = root.sinks.find(s => s.name === sink)
+                    const label = dev ? dev.description : sink
+                    if (data.error) {
+                        lines.push(label + ": " + data.error)
+                        issues++
+                    } else if (data.confidence < 0.3) {
+                        lines.push(label + ": no signal detected (conf " + Math.round(data.confidence * 100) + "%)")
+                        issues++
+                    } else if (data.delay_ms < 0) {
+                        lines.push(label + ": invalid reading " + data.delay_ms + "ms (conf " + Math.round(data.confidence * 100) + "%)")
+                        issues++
+                    } else {
+                        lines.push(label + ": " + data.delay_ms + "ms (conf " + Math.round(data.confidence * 100) + "%)")
+                        applied++
+                    }
+                }
+                let summary = ""
+                if (applied > 0) summary = applied + " offset" + (applied > 1 ? "s" : "") + " applied."
+                if (issues > 0) summary += (summary ? " " : "") + issues + " could not be measured."
+                root.syncStatus = lines.join("\n") + (summary ? "\n" + summary : "")
+            } catch(e) {
+                root.syncStatus = "Parse error: " + e.toString()
+            }
+            root.pollNow()
+        }
+    }
+
     Timer {
         interval: root.refreshMs
         repeat: true
-        running: root.expanded || root.reconnectPending
+        running: root.expanded
         triggeredOnStart: false
         onTriggered: root.pollNow()
     }
 
-    Timer {
-        id: reconnectCooldown
-        interval: 1000
-        repeat: false
-        onTriggered: {
-            root.reconnectPending = false
-            root.reconnectSinkNames = []
-            root.reconnectSourceNames = []
-        }
-    }
-
     onExpandedChanged: {
         if (root.expanded) root.pollNow()
-    }
-
-    Item {
-        id: rootLaserOverlay
-        anchors.fill: parent
-        z: 1000
-        enabled: false
     }
 }

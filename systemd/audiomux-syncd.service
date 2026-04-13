@@ -1,0 +1,12 @@
+[Unit]
+Description=AudioMux Sync Daemon
+After=pipewire.service wireplumber.service
+Requires=pipewire.service
+
+[Service]
+ExecStart=/usr/local/libexec/audiomux/audiomux-syncd.py
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

@@ -12,14 +12,12 @@ Usage:
   audiomux-source.py set-sink-offset   name ms    set per-sink latency offset
   audiomux-source.py set-source-offset name ms    set per-source latency offset
 
-Sink routing:
-  Virtual null sink (audiomux_virtual) is the default; one module-loopback
-  per active real sink reads from audiomux_virtual.monitor.
-  Per-device latency offsets are stored in ~/.config/audiomux-offsets.json
-  and applied when the loopback is (re)created.
+When the audiomux-syncd daemon is running, commands are forwarded to it
+via a Unix domain socket.  When the daemon is not running, falls back to
+direct pactl graph management (legacy mode).
 """
 
-import sys, os, json, subprocess, time, fcntl
+import sys, os, json, socket, subprocess
 import pulsectl
 
 PRIMARY_SINK        = "alsa_output.pci-0000_03_00.6.analog-stereo"
@@ -27,13 +25,49 @@ PRIMARY_SOURCE      = "alsa_input.pci-0000_03_00.6.analog-stereo"
 VIRTUAL_SINK_NAME   = "audiomux_virtual"
 COMBINE_SOURCE_NAME = "audiomux_combined_source"
 STATE_FILE          = f"/run/user/{os.getuid()}/audiomux.json"
-LOCK_FILE           = f"/run/user/{os.getuid()}/audiomux.lock"
+SOCKET_PATH         = f"/run/user/{os.getuid()}/audiomux-syncd.sock"
 OFFSETS_FILE        = os.path.expanduser("~/.config/audiomux-offsets.json")
 
 BASE_LATENCY_MS = 200   # loopback buffer before per-device offset
 
 
-# ── offset config ─────────────────────────────────────────────────────────────
+# ── daemon IPC ───────────────────────────────────────────────────────────────
+
+def _daemon_request(cmd_dict):
+    """Send a JSON command to the daemon socket, return the response dict.
+
+    Raises ConnectionRefusedError or FileNotFoundError if the daemon is not
+    running, which the caller uses to fall back to legacy mode.
+    """
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(30.0)
+        sock.connect(SOCKET_PATH)
+        sock.sendall(json.dumps(cmd_dict).encode() + b"\n")
+        # Read until newline
+        buf = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+            if b"\n" in buf:
+                break
+        return json.loads(buf.split(b"\n")[0])
+    finally:
+        sock.close()
+
+
+def _daemon_available():
+    """Check if the daemon socket exists and is connectable."""
+    try:
+        resp = _daemon_request({"cmd": "ping"})
+        return resp.get("ok", False)
+    except (ConnectionRefusedError, FileNotFoundError, OSError):
+        return False
+
+
+# ── offset config ────────────────────────────────────────────────────────────
 
 def load_offsets():
     try:
@@ -48,7 +82,7 @@ def save_offsets(offsets):
         json.dump(offsets, f, indent=2)
 
 
-# ── state file ────────────────────────────────────────────────────────────────
+# ── state file ───────────────────────────────────────────────────────────────
 
 def load_state():
     try:
@@ -70,18 +104,7 @@ def save_state(state):
         json.dump(state, f)
 
 
-class _StateLock:
-    def __enter__(self):
-        self._fh = open(LOCK_FILE, "w")
-        fcntl.flock(self._fh, fcntl.LOCK_EX)
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        fcntl.flock(self._fh, fcntl.LOCK_UN)
-        self._fh.close()
-
-
-# ── pactl wrapper ─────────────────────────────────────────────────────────────
+# ── pactl wrapper ────────────────────────────────────────────────────────────
 
 def pactl(*args):
     result = subprocess.run(["pactl"] + [str(a) for a in args],
@@ -102,7 +125,7 @@ def _service_property(service_name, property_name):
     return ""
 
 
-# ── queries ───────────────────────────────────────────────────────────────────
+# ── queries (legacy mode) ───────────────────────────────────────────────────
 
 def _live_loopback_modules():
     """Return mapping of sink names to live audiomux loopback module ids."""
@@ -329,7 +352,7 @@ def get_state():
     return {"sinks": sinks, "sources": sources, "diagnostics": diagnostics}
 
 
-# ── sink routing (virtual + loopbacks) ────────────────────────────────────────
+# ── sink routing (virtual + loopbacks) — legacy mode ─────────────────────────
 
 def _ensure_virtual_sink(state):
     live_mid = _live_virtual_sink_module_id()
@@ -419,7 +442,7 @@ def set_sink_offset(name, offset_ms):
         save_state(state)
 
 
-# ── source routing (combine) ──────────────────────────────────────────────────
+# ── source routing (combine) — legacy mode ───────────────────────────────────
 
 def set_active_sources(names):
     with pulsectl.Pulse("audiomux-set-sources") as pulse:
@@ -459,34 +482,73 @@ def set_source_offset(name, offset_ms):
     save_offsets(offsets)
 
 
-def reconnect_all():
-    with _StateLock():
-        state = load_state()
-        active_sinks = list(state.get("active_sinks") or [])
-        active_sources = list(state.get("active_sources") or [])
-
-        for sink_name in list(state.get("loopback_modules", {})):
-            _remove_loopback(state, sink_name)
-        save_state(state)
-
-        # Give PipeWire a moment to drop the old loopback graph before rebuilding.
-        time.sleep(0.35)
-
-        set_active_sinks(active_sinks, force_rebuild=True)
-        set_active_sources(active_sources)
-
-
-# ── main ──────────────────────────────────────────────────────────────────────
+# ── main ─────────────────────────────────────────────────────────────────────
 
 def main():
     args = sys.argv[1:]
 
+    # Try daemon path first
+    use_daemon = os.path.exists(SOCKET_PATH)
+
     if not args:
+        if use_daemon:
+            try:
+                resp = _daemon_request({"cmd": "get-state"})
+                if resp.get("ok"):
+                    print(json.dumps(resp["state"]))
+                    return
+            except (ConnectionRefusedError, FileNotFoundError, OSError):
+                pass
+        # Fallback to legacy
         print(json.dumps(get_state()))
         return
 
     action = args[0]
 
+    if use_daemon:
+        try:
+            if action == "set-active-sinks":
+                names = args[1].split(",") if len(args) > 1 and args[1] else []
+                resp = _daemon_request(
+                    {"cmd": "set-active-sinks", "names": names})
+            elif action == "set-active-sources":
+                names = args[1].split(",") if len(args) > 1 and args[1] else []
+                resp = _daemon_request(
+                    {"cmd": "set-active-sources", "names": names})
+            elif action == "unbond-all":
+                resp = _daemon_request({"cmd": "unbond-all"})
+            elif action == "set-sink-vol" and len(args) >= 3:
+                resp = _daemon_request(
+                    {"cmd": "set-sink-vol", "name": args[1], "pct": args[2]})
+            elif action == "set-source-vol" and len(args) >= 3:
+                resp = _daemon_request(
+                    {"cmd": "set-source-vol", "name": args[1], "pct": args[2]})
+            elif action == "set-sink-offset" and len(args) >= 3:
+                resp = _daemon_request(
+                    {"cmd": "set-sink-offset",
+                     "name": args[1], "offset_ms": int(args[2])})
+            elif action == "set-source-offset" and len(args) >= 3:
+                resp = _daemon_request(
+                    {"cmd": "set-source-offset",
+                     "name": args[1], "offset_ms": int(args[2])})
+            elif action == "set-master-sink" and len(args) >= 2:
+                resp = _daemon_request(
+                    {"cmd": "set-master-sink", "name": args[1]})
+            elif action == "check-sync":
+                resp = _daemon_request({"cmd": "check-sync"})
+                print(json.dumps(resp))
+                return
+            else:
+                resp = None
+
+            if resp is not None:
+                if not resp.get("ok"):
+                    print(json.dumps(resp), file=sys.stderr)
+                return
+        except (ConnectionRefusedError, FileNotFoundError, OSError):
+            pass  # fall through to legacy
+
+    # Legacy mode (daemon not running)
     if action == "set-active-sinks":
         names = args[1].split(",") if len(args) > 1 and args[1] else []
         set_active_sinks(names)
@@ -496,8 +558,6 @@ def main():
     elif action == "unbond-all":
         set_active_sinks([PRIMARY_SINK])
         set_active_sources([PRIMARY_SOURCE])
-    elif action == "reconnect-all":
-        reconnect_all()
     elif action == "set-sink-vol" and len(args) >= 3:
         pactl("set-sink-volume", args[1], f"{args[2]}%")
     elif action == "set-source-vol" and len(args) >= 3:
