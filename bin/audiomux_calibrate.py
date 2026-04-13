@@ -13,6 +13,7 @@ Usage: audiomux_calibrate.py <mic_device> <sink1> [sink2] ...
 import json
 import math
 import os
+import random
 import signal
 import struct
 import subprocess
@@ -72,7 +73,17 @@ def _downsample(samples, factor):
 
 
 def _xcorr_lag(ref, mic):
-    """Cross-correlate at 4kHz, return (lag_ms, confidence)."""
+    """Cross-correlate the monitor and mic buffers, returning (lag_ms, confidence).
+
+    This intentionally differs from audiomux_sync_lib.xcorr_offset:
+    - `_xcorr_lag` downsamples with `DS=12` (4kHz) instead of 48 (1kHz) so
+      the chirp retains more high-frequency content during calibration.
+    - `_xcorr_lag` only searches non-negative lags up to `max_lag`, assuming
+      the mic hears the tone after the sink monitor rather than performing a
+      bidirectional search.
+    - `_xcorr_lag` returns `(lag_ms, confidence)` in milliseconds plus
+      normalized correlation, rather than original-rate sample offsets.
+    """
     DS = 12  # 48000 → 4000Hz, Nyquist 2000Hz, keeps most of the chirp
     ref_ds = _downsample(ref, DS)
     mic_ds = _downsample(mic, DS)
@@ -164,7 +175,6 @@ def main():
     chirp_raw = _mono_to_raw(_generate_chirp())
 
     # Dither for warmup
-    import random
     dither_n = int(WARMUP * RATE)
     dither_raw = _mono_to_raw([DITHER_AMPLITUDE * (random.random() * 2 - 1)
                                for _ in range(dither_n)])
@@ -237,8 +247,17 @@ def main():
     # Stop mic
     mic_rec.stop()
 
-    rounds = [{sink: data} for sink, data in results.items()]
-    print(json.dumps({"ok": True, "rounds": rounds}))
+    tone_rounds = []
+    max_rounds = max((len(data.get("raw", [])) for data in results.values()), default=0)
+    for round_idx in range(max_rounds):
+        tone_round = {}
+        for sink, data in results.items():
+            raw_entries = data.get("raw", [])
+            if round_idx < len(raw_entries):
+                tone_round[sink] = raw_entries[round_idx]
+        tone_rounds.append(tone_round)
+
+    print(json.dumps({"ok": True, "rounds": tone_rounds}))
 
 
 def _play_raw(device, raw_data):

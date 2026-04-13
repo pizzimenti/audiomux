@@ -20,9 +20,40 @@ DS = 48
 DS_RATE = RATE // DS  # 1000 Hz
 
 
+def _capture_parecord_raw(cmd, duration, expected_bytes):
+    """Capture raw bytes from parecord for a bounded duration."""
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    stop_timer = threading.Timer(duration, proc.terminate)
+    try:
+        stop_timer.start()
+        try:
+            raw, stderr = proc.communicate(timeout=duration + 2.0)
+        except subprocess.TimeoutExpired as exc:
+            proc.kill()
+            raw, stderr = proc.communicate()
+            raise RuntimeError(
+                f"parecord timed out after {duration + 2.0:.1f}s"
+            ) from exc
+        if proc.returncode not in (0, -15):
+            err_text = (stderr or b"").decode(errors="replace").strip()
+            raise RuntimeError(err_text or f"parecord exited with {proc.returncode}")
+        return raw[:expected_bytes]
+    finally:
+        stop_timer.cancel()
+        if proc.stdout:
+            proc.stdout.close()
+        if proc.stderr:
+            proc.stderr.close()
+
+
 def record_monitor(sink, duration, rate=RATE):
     """Record from a sink's monitor source, return mono float samples."""
     n_frames = int(duration * rate)
+    expected_bytes = n_frames * S16_FRAME
     cmd = [
         "parecord",
         "--device", f"{sink}.monitor",
@@ -32,16 +63,8 @@ def record_monitor(sink, duration, rate=RATE):
         "--raw",
         "--latency-msec", "10",
     ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    raw = proc.stdout.read(n_frames * S16_FRAME)
-    proc.terminate()
-    proc.wait()
-    # Convert stereo S16LE to mono float
-    samples = []
-    for i in range(0, len(raw) - S16_FRAME + 1, S16_FRAME):
-        l, r = struct.unpack_from("<hh", raw, i)
-        samples.append((l + r) / 2.0)
-    return samples
+    raw = _capture_parecord_raw(cmd, duration, expected_bytes)
+    return raw_to_mono(raw)
 
 
 def downsample(samples, factor=DS):
@@ -73,19 +96,19 @@ def xcorr_offset(a, b, max_lag_ms=500, ds_rate=DS_RATE):
 
     mean_a = sum(a) / n
     mean_b = sum(b) / n
-    a = [x - mean_a for x in a[:n]]
-    b = [x - mean_b for x in b[:n]]
-    sa = math.sqrt(sum(x * x for x in a))
-    sb = math.sqrt(sum(x * x for x in b))
+    a_centered = [x - mean_a for x in a[:n]]
+    b_centered = [x - mean_b for x in b[:n]]
+    sa = math.sqrt(sum(x * x for x in a_centered))
+    sb = math.sqrt(sum(x * x for x in b_centered))
     if sa == 0 or sb == 0:
         return 0, 0.0
 
     best_lag, best_corr = 0, -1.0
     for lag in range(-max_lag, max_lag + 1):
         if lag >= 0:
-            s = sum(x * y for x, y in zip(a[lag:], b[: n - lag]))
+            s = sum(x * y for x, y in zip(a_centered[lag:], b_centered[: n - lag]))
         else:
-            s = sum(x * y for x, y in zip(a[: n + lag], b[-lag:]))
+            s = sum(x * y for x, y in zip(a_centered[: n + lag], b_centered[-lag:]))
         c = s / (sa * sb)
         if c > best_corr:
             best_corr, best_lag = c, lag
@@ -165,6 +188,7 @@ def raw_to_mono(raw_bytes):
 def record_mic(device, duration, rate=RATE):
     """Record from a real microphone input, return mono float samples."""
     n_frames = int(duration * rate)
+    expected_bytes = n_frames * S16_FRAME
     cmd = [
         "parecord",
         "--device", device,
@@ -174,10 +198,7 @@ def record_mic(device, duration, rate=RATE):
         "--raw",
         "--latency-msec", "5",
     ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    raw = proc.stdout.read(n_frames * S16_FRAME)
-    proc.terminate()
-    proc.wait()
+    raw = _capture_parecord_raw(cmd, duration, expected_bytes)
     return raw_to_mono(raw)
 
 

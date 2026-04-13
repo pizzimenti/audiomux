@@ -89,8 +89,6 @@ PlasmoidItem {
     }
 
     function onSinkToggled(name, active) {
-        if (active)
-            runCmd(root.sourceCmd + " set-sink-offset " + name + " 0")
         const actives = root.sinks
             .filter(s => s.name === name ? active : s.active)
             .map(s => s.name)

@@ -15,6 +15,9 @@ if [[ -z "$PLASMOID_ID" ]]; then
 fi
 
 log() { printf '==> %s\n' "$*"; }
+daemon_status() { "$LIBEXEC_DIR/audiomux-source.py" daemon-status 2>/dev/null || true; }
+daemon_calibration_active() { daemon_status | grep -q '"calibration_in_progress": true'; }
+DAEMON_PATTERN='audiomux-syncd'
 
 # ── privileged install (needs root for /usr/local) ───────────────────────────
 
@@ -52,9 +55,27 @@ log "Installing systemd user unit to $SYSTEMD_USER_DIR"
 mkdir -p "$SYSTEMD_USER_DIR"
 install -m 644 "$SCRIPT_DIR/systemd/audiomux-syncd.service" "$SYSTEMD_USER_DIR/audiomux-syncd.service"
 systemctl --user daemon-reload
-# Stop old daemon forcefully in case it's stuck in calibration
+if daemon_calibration_active; then
+    log "Calibration is in progress; allowing audiomux-syncd a short grace period to stop cleanly"
+fi
 systemctl --user stop audiomux-syncd.service 2>/dev/null || true
-pkill -9 -f 'audiomux-syncd' 2>/dev/null || true
+if pgrep -f "$DAEMON_PATTERN" >/dev/null 2>&1; then
+    if daemon_calibration_active; then
+        for _ in {1..15}; do
+            if ! pgrep -f "$DAEMON_PATTERN" >/dev/null 2>&1; then
+                break
+            fi
+            if ! daemon_calibration_active; then
+                break
+            fi
+            sleep 1
+        done
+    fi
+    if pgrep -f "$DAEMON_PATTERN" >/dev/null 2>&1; then
+        log "audiomux-syncd did not stop cleanly; sending SIGKILL"
+        pkill -9 -f "$DAEMON_PATTERN" 2>/dev/null || true
+    fi
+fi
 systemctl --user enable --now audiomux-syncd.service || true
 
 # ── icon ──────────────────────────────────────────────────────────────────────
@@ -98,7 +119,10 @@ PANEL_RC="$TARGET_HOME/.config/plasma-org.kde.plasma.desktop-appletsrc"
 if [[ -f "$PANEL_RC" ]] && ! grep -q "plugin=$PLASMOID_ID" "$PANEL_RC"; then
     log "Adding audiomux applet to panel"
     python3 - "$PANEL_RC" "$PLASMOID_ID" <<'PYSCRIPT'
-import sys, re, pathlib
+import pathlib
+import re
+import shutil
+import sys
 
 rc_path, applet_id = sys.argv[1], sys.argv[2]
 text = pathlib.Path(rc_path).read_text()
@@ -170,6 +194,13 @@ for line in lines:
 
 if not inserted:
     out.append(new_section)
+
+backup_path = f"{rc_path}.bak"
+try:
+    shutil.copy2(rc_path, backup_path)
+except OSError as exc:
+    print(f"  Failed to back up {rc_path} to {backup_path}: {exc}", file=sys.stderr)
+    sys.exit(1)
 
 pathlib.Path(rc_path).write_text(''.join(out))
 print(f"  Added as applet {next_id}")

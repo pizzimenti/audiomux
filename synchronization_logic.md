@@ -48,7 +48,7 @@ Example with three outputs:
 `GraphManager._compute_delays()` converts offsets to pw-loopback `--delay`
 values:
 
-```
+```text
 max_offset = max(all active offsets)
 delay[device] = max_offset - offset[device]
 ```

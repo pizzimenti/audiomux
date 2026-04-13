@@ -49,6 +49,7 @@ SOCKET_PATH        = f"{RUN_DIR}/audiomux-syncd.sock"
 OFFSETS_FILE       = os.path.expanduser("~/.config/audiomux-offsets.json")
 
 BASE_LATENCY_MS    = 50    # pw-loopback buffer (much lower than legacy 200ms)
+BT_COMPENSATION_MS = int(os.environ.get("AUDIOMUX_BT_COMPENSATION_MS", "0"))
 RECONCILE_INTERVAL = 30    # seconds between full reconciliation sweeps
 
 # Sync measurement
@@ -949,6 +950,7 @@ class SocketServer:
         self._state_writer = state_writer
         self._measurer = measurer
         self._server = None
+        self._calibration_in_progress = False
 
     async def start(self):
         self._cleanup_stale_socket()
@@ -973,7 +975,6 @@ class SocketServer:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             sock.connect(SOCKET_PATH)
-            sock.close()
             log.error("another audiomux-syncd is already running")
             sys.exit(1)
         except ConnectionRefusedError:
@@ -1077,155 +1078,172 @@ class SocketServer:
                 # Acoustic calibration runs in a SUBPROCESS so the
                 # daemon never holds the mic.  If the subprocess hangs,
                 # kill -9 releases everything.
+                self._calibration_in_progress = True
                 active = self._graph._active_loopback_sinks()
-                if len(active) < 2:
-                    return {"ok": False,
-                            "error": "need 2+ active outputs to calibrate"}
-                with pulsectl.Pulse("audiomux-calibrate") as pulse:
-                    mic = pulse.server_info().default_source_name
-                if not mic or "monitor" in mic:
-                    return {"ok": False, "error": "no microphone found"}
-
-                sinks = sorted(active)
-                log.info("calibration: starting subprocess (mic=%s, "
-                         "sinks=%s)", mic, sinks)
-
-                # Mute loopbacks during calibration
-                for sn in list(active):
-                    self._graph._remove_loopback(sn)
-
-                # Build tone specs: 8 tones in a rising diatonic scale,
-                # alternating between speakers.  Each speaker gets 4 tones.
-                n_tones = min(8, len(CALIBRATE_FREQS))
-                round_specs = []
-                for i in range(n_tones):
-                    sink = sinks[i % len(sinks)]
-                    freq = CALIBRATE_FREQS[i]
-                    round_specs.append({"sink": sink, "freq": freq})
-
-                # Run calibration in isolated subprocess
-                cal_script = os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)),
-                    "audiomux_calibrate.py")
-                cal_cmd = [sys.executable, cal_script, mic] + sinks
-                cal_error = None
-                cal_result = None
                 try:
-                    proc = subprocess.Popen(
-                        cal_cmd,
-                        stdin=subprocess.PIPE,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                    )
-                    stdout, stderr = proc.communicate(
-                        input=json.dumps(round_specs).encode(),
-                        timeout=45,
-                    )
-                    if proc.returncode != 0:
-                        cal_error = f"subprocess exited {proc.returncode}"
-                        if stderr:
-                            cal_error += f": {stderr.decode()[:200]}"
-                    else:
-                        cal_result = json.loads(stdout.decode())
-                        if not cal_result.get("ok"):
-                            cal_error = cal_result.get("error", "unknown")
-                except subprocess.TimeoutExpired:
-                    log.warning("calibration subprocess timed out, killing")
-                    proc.kill()
-                    proc.wait()
-                    cal_error = "calibration timed out (mic released)"
-                except Exception as e:
-                    cal_error = str(e)
-                    log.exception("calibration subprocess failed")
+                    if len(active) < 2:
+                        return {"ok": False,
+                                "error": "need 2+ active outputs to calibrate"}
+                    with pulsectl.Pulse("audiomux-calibrate") as pulse:
+                        mic = pulse.server_info().default_source_name
+                    if not mic or "monitor" in mic:
+                        return {"ok": False, "error": "no microphone found"}
 
-                # ALWAYS restore loopbacks
-                log.info("calibration: restoring loopbacks")
-                for sn in sinks:
-                    self._graph._add_loopback(sn)
+                    sinks = sorted(active)
+                    log.info("calibration: starting subprocess (mic=%s, "
+                             "sinks=%s)", mic, sinks)
 
-                if cal_error:
-                    self._graph.invalidate_state_cache()
-                    self._state_writer.notify()
-                    return {"ok": False, "error": cal_error}
-
-                # Process results from subprocess
-                all_measurements = {sn: [] for sn in sinks}
-                for rn, results_round in enumerate(
-                        cal_result.get("rounds", [])):
-                    if "error" in results_round:
-                        log.warning("calibration: round %d error: %s",
-                                    rn + 1, results_round["error"])
-                        continue
-                    for sn, data in results_round.items():
-                        delay = data.get("delay_ms", 0)
-                        conf = data.get("confidence", 0)
-                        all_measurements[sn].append((delay, conf))
-                        log.info("calibration: round %d %s = "
-                                 "%.1fms (conf %.2f, %.0fHz)",
-                                 rn + 1, sn, delay, conf,
-                                 data.get("freq", 0))
-
-                # Average good measurements per sink
-                results = {}
-                for sn in sinks:
-                    good = [(d, c) for d, c in all_measurements[sn]
-                            if c > 0.1 and d >= 0]
-                    if good:
-                        avg_delay = sum(d for d, _ in good) / len(good)
-                        avg_conf = sum(c for _, c in good) / len(good)
-                        results[sn] = {
-                            "delay_ms": round(avg_delay, 1),
-                            "confidence": round(avg_conf, 2),
-                            "rounds": len(good),
-                        }
-                    else:
-                        results[sn] = {
-                            "delay_ms": 0, "confidence": 0,
-                            "rounds": 0, "error": "no signal detected",
-                        }
-
-                # Apply offsets (normalized: fastest = 0)
-                good_results = {k: v for k, v in results.items()
-                                if "error" not in v}
-                if good_results:
-                    # Bluetooth codec latency is systematically
-                    # underestimated by ~45ms because the calibration
-                    # tone traverses the codec faster than real audio.
-                    BT_COMPENSATION_MS = 0
-                    for sn in good_results:
-                        if "bluez" in sn:
-                            good_results[sn] = dict(good_results[sn])
-                            good_results[sn]["delay_ms"] += BT_COMPENSATION_MS
-                            log.info("calibration: added %dms BT "
-                                     "compensation to %s",
-                                     BT_COMPENSATION_MS, sn)
-
-                    min_delay = min(v["delay_ms"]
-                                    for v in good_results.values())
-                    offsets = load_offsets()
-                    for sn, data in good_results.items():
-                        offsets[sn] = max(0, round(
-                            data["delay_ms"] - min_delay))
-                    save_offsets(offsets)
-                    log.info("calibration: normalized "
-                             "(min=%.1fms subtracted)", min_delay)
-                    # Rebuild with new delays
-                    for sn in list(
-                            self._graph._active_loopback_sinks()):
+                    # Mute loopbacks during calibration
+                    for sn in list(active):
                         self._graph._remove_loopback(sn)
+
+                    # Build tone specs: 8 tones in a rising diatonic scale,
+                    # alternating between speakers.  Each speaker gets 4 tones.
+                    n_tones = min(8, len(CALIBRATE_FREQS))
+                    round_specs = []
+                    for i in range(n_tones):
+                        sink = sinks[i % len(sinks)]
+                        freq = CALIBRATE_FREQS[i]
+                        round_specs.append({"sink": sink, "freq": freq})
+
+                    # Run calibration in isolated subprocess
+                    cal_script = os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)),
+                        "audiomux_calibrate.py")
+                    cal_cmd = [sys.executable, cal_script, mic] + sinks
+                    cal_error = None
+                    cal_result = None
+                    try:
+                        proc = subprocess.Popen(
+                            cal_cmd,
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                        )
+                        stdout, stderr = proc.communicate(
+                            input=json.dumps(round_specs).encode(),
+                            timeout=45,
+                        )
+                        if proc.returncode != 0:
+                            cal_error = f"subprocess exited {proc.returncode}"
+                            if stderr:
+                                cal_error += f": {stderr.decode()[:200]}"
+                        else:
+                            cal_result = json.loads(stdout.decode())
+                            if not cal_result.get("ok"):
+                                cal_error = cal_result.get("error", "unknown")
+                    except subprocess.TimeoutExpired:
+                        log.warning("calibration subprocess timed out, killing")
+                        proc.kill()
+                        proc.wait()
+                        cal_error = "calibration timed out (mic released)"
+                    except Exception as e:
+                        cal_error = str(e)
+                        log.exception("calibration subprocess failed")
+
+                    # ALWAYS restore loopbacks
+                    log.info("calibration: restoring loopbacks")
                     for sn in sinks:
                         self._graph._add_loopback(sn)
-                    applied = {k: offsets.get(k, 0) for k in sinks}
-                    log.info("calibration: offsets applied %s", applied)
-                else:
-                    log.warning("calibration: no usable readings")
 
-                self._graph.invalidate_state_cache()
-                self._state_writer.notify()
-                return {"ok": True, "mic": mic, "results": results}
+                    if cal_error:
+                        self._graph.invalidate_state_cache()
+                        self._state_writer.notify()
+                        return {"ok": False, "error": cal_error}
+
+                    # Process results from subprocess
+                    all_measurements = {sn: [] for sn in sinks}
+                    for rn, results_round in enumerate(
+                            cal_result.get("rounds", [])):
+                        if "error" in results_round:
+                            log.warning("calibration: round %d error: %s",
+                                        rn + 1, results_round["error"])
+                            continue
+                        for sn, data in results_round.items():
+                            delay = data.get("delay_ms", 0)
+                            conf = data.get("confidence", 0)
+                            all_measurements[sn].append((delay, conf))
+                            log.info("calibration: round %d %s = "
+                                     "%.1fms (conf %.2f, %.0fHz)",
+                                     rn + 1, sn, delay, conf,
+                                     data.get("freq", 0))
+
+                    # Average good measurements per sink
+                    results = {}
+                    for sn in sinks:
+                        good = [(d, c) for d, c in all_measurements[sn]
+                                if c > 0.1 and d >= 0]
+                        if good:
+                            avg_delay = sum(d for d, _ in good) / len(good)
+                            avg_conf = sum(c for _, c in good) / len(good)
+                            results[sn] = {
+                                "delay_ms": round(avg_delay, 1),
+                                "confidence": round(avg_conf, 2),
+                                "rounds": len(good),
+                            }
+                        else:
+                            results[sn] = {
+                                "delay_ms": 0, "confidence": 0,
+                                "rounds": 0, "error": "no signal detected",
+                            }
+
+                    # Apply offsets (normalized: fastest = 0)
+                    good_results = {k: v for k, v in results.items()
+                                    if "error" not in v}
+                    if good_results:
+                        if BT_COMPENSATION_MS:
+                            log.info(
+                                "calibration: applying %dms Bluetooth compensation",
+                                BT_COMPENSATION_MS,
+                            )
+                        else:
+                            log.info(
+                                "calibration: Bluetooth compensation disabled; "
+                                "set AUDIOMUX_BT_COMPENSATION_MS to enable it"
+                            )
+                        for sn in good_results:
+                            if "bluez" in sn:
+                                good_results[sn] = dict(good_results[sn])
+                                good_results[sn]["delay_ms"] += BT_COMPENSATION_MS
+                                if BT_COMPENSATION_MS:
+                                    log.info(
+                                        "calibration: added %dms BT compensation to %s",
+                                        BT_COMPENSATION_MS,
+                                        sn,
+                                    )
+
+                        min_delay = min(v["delay_ms"]
+                                        for v in good_results.values())
+                        offsets = load_offsets()
+                        for sn, data in good_results.items():
+                            offsets[sn] = max(0, round(
+                                data["delay_ms"] - min_delay))
+                        save_offsets(offsets)
+                        log.info("calibration: normalized "
+                                 "(min=%.1fms subtracted)", min_delay)
+                        # Rebuild with new delays
+                        for sn in list(
+                                self._graph._active_loopback_sinks()):
+                            self._graph._remove_loopback(sn)
+                        for sn in sinks:
+                            self._graph._add_loopback(sn)
+                        applied = {k: offsets.get(k, 0) for k in sinks}
+                        log.info("calibration: offsets applied %s", applied)
+                    else:
+                        log.warning("calibration: no usable readings")
+
+                    self._graph.invalidate_state_cache()
+                    self._state_writer.notify()
+                    return {"ok": True, "mic": mic, "results": results}
+                finally:
+                    self._calibration_in_progress = False
 
             elif cmd == "ping":
-                return {"ok": True, "pid": os.getpid()}
+                return {
+                    "ok": True,
+                    "pid": os.getpid(),
+                    "calibration_in_progress": self._calibration_in_progress,
+                }
 
             else:
                 return {"ok": False, "error": f"unknown command: {cmd}"}

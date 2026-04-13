@@ -28,7 +28,7 @@ STATE_FILE          = f"/run/user/{os.getuid()}/audiomux.json"
 SOCKET_PATH         = f"/run/user/{os.getuid()}/audiomux-syncd.sock"
 OFFSETS_FILE        = os.path.expanduser("~/.config/audiomux-offsets.json")
 
-BASE_LATENCY_MS = 200   # loopback buffer before per-device offset
+BASE_LATENCY_MS = 200   # conservative legacy-mode loopback buffer; daemon mode uses 50ms
 
 
 # ── daemon IPC ───────────────────────────────────────────────────────────────
@@ -41,7 +41,8 @@ def _daemon_request(cmd_dict):
     """
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        sock.settimeout(30.0)
+        timeout = 90.0 if cmd_dict.get("cmd") == "check-sync" else 30.0
+        sock.settimeout(timeout)
         sock.connect(SOCKET_PATH)
         sock.sendall(json.dumps(cmd_dict).encode() + b"\n")
         # Read until newline
@@ -488,7 +489,7 @@ def main():
     args = sys.argv[1:]
 
     # Try daemon path first
-    use_daemon = os.path.exists(SOCKET_PATH)
+    use_daemon = _daemon_available()
 
     if not args:
         if use_daemon:
@@ -538,6 +539,10 @@ def main():
                 resp = _daemon_request({"cmd": "check-sync"})
                 print(json.dumps(resp))
                 return
+            elif action == "daemon-status":
+                resp = _daemon_request({"cmd": "ping"})
+                print(json.dumps(resp))
+                return
             else:
                 resp = None
 
@@ -566,6 +571,9 @@ def main():
         set_sink_offset(args[1], int(args[2]))
     elif action == "set-source-offset" and len(args) >= 3:
         set_source_offset(args[1], int(args[2]))
+    elif action in {"set-master-sink", "check-sync", "daemon-status"}:
+        print(json.dumps({"ok": False, "error": "daemon not running"}), file=sys.stderr)
+        return
 
 
 if __name__ == "__main__":
