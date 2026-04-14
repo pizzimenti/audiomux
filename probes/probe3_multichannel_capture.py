@@ -88,11 +88,11 @@ def start_parecord(monitor_name, out_path, duration):
          "--rate", str(RATE),
          "--channels", str(CHANNELS),
          "--format", "s16le",
+         "--latency-msec", "20",
          "--raw",
-         "--file-format=raw",
          out_path],
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
         preexec_fn=os.setsid,
     )
 
@@ -166,9 +166,17 @@ def main():
             r.terminate()
         for r in recs:
             try:
-                r.wait(timeout=2)
+                stdout, stderr_bytes = r.communicate(timeout=2)
+                if stderr_bytes:
+                    print(f"  [parecord stderr] {stderr_bytes.decode()[:200]}")
             except subprocess.TimeoutExpired:
                 r.kill()
+                r.wait()
+
+        # Verify files actually got written
+        for mon, path in zip(monitors, paths):
+            size = os.path.getsize(path) if os.path.exists(path) else -1
+            print(f"  file for {mon}: {size} bytes")
 
         # Load and find click in each capture.
         results = []

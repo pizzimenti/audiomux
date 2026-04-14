@@ -59,9 +59,9 @@ def pw_top_snapshot():
     return r.stdout
 
 
-def unload(module_id):
+def unload_via_pw_cli(module_id):
     if module_id:
-        run("pactl", "unload-module", str(module_id))
+        run("pw-cli", "destroy", str(module_id))
 
 
 def main():
@@ -72,22 +72,31 @@ def main():
 
     print(f"[probe1] real sinks available: {sinks}")
 
-    # Load combine-stream. module-combine-stream auto-picks sinks via stream.rules;
-    # without explicit rules it uses all non-monitor sinks. Force a name so we
-    # can find it later.
-    load = run(
-        "pactl", "load-module", "module-combine-stream",
-        "combine.mode=sink",
-        f"node.name={VIRTUAL_NAME}",
-        "node.description=AudioMuxProbe1",
-        "combine.latency-compensate=true",
-        "audio.position=[FL,FR]",
+    # Load combine-stream via pw-cli (native PipeWire module interface).
+    # pactl load-module is PulseAudio-compat only and doesn't see combine-stream.
+    config = (
+        '{ '
+        'combine.mode = sink '
+        f'node.name = "{VIRTUAL_NAME}" '
+        'node.description = "AudioMuxProbe1" '
+        'combine.latency-compensate = true '
+        'audio.position = [ FL FR ] '
+        '}'
     )
-    if load.returncode != 0 or not load.stdout.strip().isdigit():
-        print(f"[probe1] load-module failed: {load.stderr}", file=sys.stderr)
+    load = run("pw-cli", "load-module", "libpipewire-module-combine-stream", config)
+    if load.returncode != 0:
+        print(f"[probe1] pw-cli load-module failed rc={load.returncode}",
+              file=sys.stderr)
+        print(f"         stdout: {load.stdout!r}", file=sys.stderr)
+        print(f"         stderr: {load.stderr!r}", file=sys.stderr)
         return 3
-    module_id = int(load.stdout.strip())
-    print(f"[probe1] loaded module-combine-stream id={module_id}")
+    # pw-cli prints something like: "Loaded module ... (id=42)"
+    module_id = None
+    for tok in load.stdout.split():
+        if tok.isdigit():
+            module_id = int(tok)
+            break
+    print(f"[probe1] loaded combine-stream id={module_id}  (raw stdout: {load.stdout.strip()!r})")
 
     try:
         time.sleep(0.5)
@@ -156,7 +165,7 @@ def main():
             play.wait(timeout=1)
 
     finally:
-        unload(module_id)
+        unload_via_pw_cli(module_id)
         print(f"[probe1] unloaded module {module_id}")
 
     print()
