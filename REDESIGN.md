@@ -179,11 +179,15 @@ the current plasmoid.
 
 **Phase 0 — branch setup and experiments** (~½ day) — **DONE** (see §6).
 
-**Phase 1 — GraphOwner rewrite** (1–2 days)
-Replace `GraphManager` with a class that loads a single `module-combine-sink`
-and manages membership + `latencyOffsetNsec`. Keep the existing offsets JSON
-schema initially. Remove `pw-loopback` spawning, `_loopback_procs`, legacy
-cleanup, offset-flush-debounce. Drop `BT_COMPENSATION_MS`.
+**Phase 1 — GraphOwner rewrite** — **DONE**
+Replaced `GraphManager`: one `module-combine-sink` + `latencyOffsetNsec`
+written via `pw-cli set-param`. Removed `pw-loopback` spawning,
+`_loopback_procs`, legacy cleanup, offset-flush-debounce, `BT_COMPENSATION_MS`.
+Added startup migration step that kills stray 0.2.0 pw-loopback children and
+unloads any legacy `module-null-sink` named `audiomux_virtual`. Offset apply
+is now fingerprinted — no-op when `(active_sinks, offsets)` is unchanged,
+which silences the per-pw-dump-event reconcile spam the 0.2.0 daemon masked
+by doing nothing in that path.
 
 **Phase 2 — Calibrator rewrite** (2 days)
 Rewrite `audiomux_calibrate.py`: one sweep + parecord per source + GCC-PHAT.
