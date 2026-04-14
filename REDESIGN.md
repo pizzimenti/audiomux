@@ -179,15 +179,36 @@ the current plasmoid.
 
 **Phase 0 — branch setup and experiments** (~½ day) — **DONE** (see §6).
 
-**Phase 1 — GraphOwner rewrite** — **DONE**
-Replaced `GraphManager`: one `module-combine-sink` + `latencyOffsetNsec`
-written via `pw-cli set-param`. Removed `pw-loopback` spawning,
-`_loopback_procs`, legacy cleanup, offset-flush-debounce, `BT_COMPENSATION_MS`.
-Added startup migration step that kills stray 0.2.0 pw-loopback children and
-unloads any legacy `module-null-sink` named `audiomux_virtual`. Offset apply
-is now fingerprinted — no-op when `(active_sinks, offsets)` is unchanged,
-which silences the per-pw-dump-event reconcile spam the 0.2.0 daemon masked
-by doing nothing in that path.
+**Phase 1 — GraphOwner rewrite** — **DONE (then reverted on 2026-04-14)**
+First attempt used `module-combine-sink` + `Props.latencyOffsetNsec`
+written via `pw-cli set-param`. Probe 2 in Phase 0 had verified the prop
+write lands and `pw-dump` echoes it; what it *didn't* verify was whether
+the value actually delays audio. Bench test during beta (2026-04-14,
+analog sink, offset 0 vs 500 ms): mic-heard click moved by 45 ms —
+pure capture jitter, not a real delay. `Props.latencyOffsetNsec` is a
+reporting hint consumed by latency-aware apps, **not** a buffer-delay
+value.
+
+Reverted to the 0.2.0 shape: one `module-null-sink` named
+`audiomux_virtual` + one `pw-loopback` per active hardware sink with
+`--delay` set from the calibration result. Sink-set changes spawn/kill
+individual loopbacks (non-disruptive to sinks that keep their state);
+offset changes respawn just the affected loopback (brief gap on that one
+sink, others keep playing). `_ensure_loopbacks` tracks the last delay
+spawned per sink so no-op changes don't cause respawns. Startup
+migration kills orphan `pw-loopback` children from a crashed previous
+daemon and unloads any stray Phase-1 `module-combine-sink` from this
+branch's earlier commits.
+
+`BT_COMPENSATION_MS`, the per-change debounce, the `_loopback_procs`
+data structure, and the offset fingerprint are all still gone — those
+were correct simplifications independent of the mechanism swap.
+
+Observability: daemon logs hotplug events for new/disappearing
+sinks/sources, `Params.Latency.Input` changes per sink (useful for
+watching BT codec buffer depths on connect), every manual offset change
+with old→new, calibration peak_ratio per round, and a per-follower
+drift summary every 30 s.
 
 **Phase 2 — Calibrator rewrite** — **DONE**
 Rewrote `audiomux_calibrate.py` around GCC-PHAT (`audiomux_sync_lib.py`
