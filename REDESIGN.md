@@ -241,9 +241,17 @@ Python bindings for sub-ms detection. Bench validation: BT follower
 sampled 11 times over 30 s, latency steady at 145.2 ms, status
 `synced`, no spurious resyncs.
 
-**Phase 4 — Plasmoid update** (½ day)
-Live drift label; hide +/- buttons; rename Sync Delay → Calibrate;
-confidence badges.
+**Phase 4 — Plasmoid update** — **DONE** (pending visual check)
+Renamed the header button "Sync Delay" → "Calibrate" (and in-progress
+text to "Calibrating…"). Added a live drift-status badge per active
+follower sink — "synced" (positive color), "measuring…" (neutral),
+"+12ms" (negative color when degraded or resyncing) — driven by the
+Phase-3 DriftMonitor telemetry in `sinks[].sync`. Manual +/- offset
+buttons on sinks are now hidden behind `showManualOffsets` (default
+false); they stay as an escape hatch for ad-hoc nudging but aren't a
+first-class tool now that calibration is reliable. Existing sync-
+status summary after calibration keeps working (still reads
+`results[sink].delay_ms / confidence`).
 
 **Phase 5 — Validation** (1 day)
 Three bench tests:
