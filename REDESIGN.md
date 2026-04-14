@@ -1,7 +1,12 @@
 # AudioMux Sync Redesign
 
 _Working document for the `feat/sync-redesign` branch. Delete before merging
-to `main` (same convention as `FUTURE.md`)._
+to `main`._
+
+_Supersedes the prior `FUTURE.md` roadmap ("master clock with continuous
+adaptive rate matching") by executing its chosen direction, and subsumes
+`docs/calibration_consult.md`'s record of failed calibration approaches as
+Appendix A below._
 
 ## 1. Why redesign
 
@@ -202,8 +207,7 @@ Three bench tests:
 
 **Phase 6 — Merge criteria** (⅓ day)
 Auto-sync stays within ±10 ms for 1 h continuous playback, survives BT
-reconnect, no manual offset changes needed. Merge, delete `FUTURE.md` and
-this file.
+reconnect, no manual offset changes needed. Merge and delete this file.
 
 ## 5. Migration & rollout
 
@@ -314,3 +318,72 @@ in §3.2.
    1 week without needing them.
 5. **Zero band-aids**: `AUDIOMUX_BT_COMPENSATION_MS` removed, not just defaulted
    off.
+
+## Appendix A. Calibration approaches that did not work
+
+_Imported from `docs/calibration_consult.md`. These are the four
+measurement strategies we tried before settling on GCC-PHAT between mic and
+sink monitor (§3.2). Each one failed in a specific way that informs the
+current design._
+
+The correct answer for the bench setup is approximately:
+
+- Analog line-out: ~60–80 ms (DAC + amp, near-instant)
+- HDMI: ~200–280 ms (TV/receiver processing)
+- Bluetooth: ~500–600 ms (codec buffering, variable)
+
+→ Analog offset ≈ 0 ms (baseline), Bluetooth offset ≈ 260 ms relative to analog.
+
+### A.1 Sequential `paplay` per tone
+
+Play a unique-frequency tone through each sink one at a time via separate
+`paplay` processes. Record from the laptop mic with `parecord`. Goertzel
+energy detector finds each tone's onset; delay = (mic onset time) − (emit
+time).
+
+**Result:** ~85 ms jitter between readings for the same device. Each `paplay`
+process has variable PipeWire startup latency (50–150 ms). The `emit_ms`
+timestamp (`time.perf_counter()` before launching `paplay`) does not
+correspond to when PipeWire actually outputs audio.
+
+### A.2 Pre-built continuous audio streams
+
+Build one continuous raw audio stream per sink with tones at precise sample
+positions. Launch one `paplay` per sink simultaneously. Compute emit times
+from sample offsets instead of wall clock.
+
+**Result:** worse. Different per-sink startup latencies to their respective
+sinks. Analog readings became a flat constant (detecting an artifact), BT
+readings became wild (−100 ms to 1400 ms). The sample-offset timing model
+does not account for per-sink PipeWire startup-latency differences.
+
+### A.3 Hum primer to warm BT codec
+
+Play a quiet 100 Hz hum through all sinks before calibration to prime the BT
+codec's buffers. Calibration otherwise underestimates BT delay by ~90 ms when
+the codec is cold.
+
+**Result:** helped somewhat (~45 ms improvement), but the hum's harmonics
+interfered with the Goertzel detector, and BT codec cold-start is only part
+of the systematic undershoot.
+
+### A.4 Hardcoded BT compensation factor
+
+Add a fixed +45–120 ms to all Bluetooth measurements (`AUDIOMUX_BT_COMPENSATION_MS`).
+
+**Result:** too variable. Different runs need different compensation.
+Arbitrary offset does not address the root measurement problem. Shipped in
+0.2.0 as a last-resort toggle; removed by Phase 1 of this plan.
+
+### Core difficulty these approaches share
+
+**Circular dependency:** to calculate delay, we need to know when the tone
+was emitted. To know when it was emitted, we'd need to measure it — which is
+what we're trying to do. `time.perf_counter()` tells us when we asked PipeWire
+to play audio, not when PipeWire actually handed samples to the hardware.
+This latency differs per sink and per invocation.
+
+§3.2's GCC-PHAT approach breaks the loop by taking the monitor stream as the
+"actual emit" reference, so the only remaining question is *"mic vs. monitor
+— what's the acoustic delay?"*, which is a straight cross-correlation with
+no emit-time dependency.
