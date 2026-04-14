@@ -674,24 +674,160 @@ class GraphManager:
         self._unload_combine_sink()
 
 
-# ── SyncMeasurer ─────────────────────────────────────────────────────────────
+# ── DriftMonitor ─────────────────────────────────────────────────────────────
 
-class SyncMeasurer:
-    """Phase-1 stub. Disabled by default. Phase 3 replaces this with passive
-    pw-dump telemetry (no mic involvement)."""
+class DriftMonitor:
+    """Passive drift telemetry from `pw-dump` snapshots.
+
+    Samples each active follower sink's `Params.Latency.Input.minNs` at a
+    regular cadence. Tracks a rolling window per sink, computes:
+      - current latency (ms)
+      - offset from the rolling-window median (the stable baseline)
+      - slope over the window (ms/minute → effectively a drift rate)
+      - jitter (stddev)
+    and surfaces the derived status in `get_sync_info(sink_name)`.
+
+    This replaces the 0.2.0 `SyncMeasurer` that shelled out to `parecord`
+    every 3 s — that approach was disabled in production because running
+    parecord on the mic at that cadence caused audible clicking (see
+    REDESIGN.md §1 / `audiomux-syncd.py:659` in 0.2.0). `Params.Latency` is
+    first-class PipeWire telemetry with no side effects on the mic or the
+    audio graph.
+
+    Hard-resync policy (mirrors Snapcast / Shairport):
+      |offset| < 5 ms                         → synced, do nothing.
+      5 ms ≤ |offset| < DRIFT_RECOVER_MS      → degraded, flag in UI.
+      |offset| ≥ DRIFT_RECOVER_MS for
+        DRIFT_RECOVER_COUNT consecutive polls → rebuild the combine sink
+                                                (cooled by RESYNC_COOLDOWN).
+    """
+
+    RESYNC_COOLDOWN_S = 2.0
 
     def __init__(self, graph):
         self._graph = graph
         self._history = collections.defaultdict(
             lambda: collections.deque(maxlen=MEASURE_WINDOW))
         self._exceed_count = collections.defaultdict(int)
-        self._last_offset = {}
-        self.enabled = False
+        self._last_resync_ts = 0.0
+        self._lock = threading.Lock()
+        self.enabled = True
 
     async def run(self):
         while True:
             await asyncio.sleep(MEASURE_INTERVAL)
-            # Phase 3 replaces this body with pw-dump-based drift monitoring.
+            if not self.enabled or self._graph._calibrating:
+                continue
+            try:
+                self._sample()
+                self._maybe_resync()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("drift sampling failed")
+
+    def _sample(self):
+        dump = _pw_dump()
+        active = set(self._graph.active_sinks())
+        now = time.time()
+        with self._lock:
+            for obj in dump:
+                if obj.get("type") != "PipeWire:Interface:Node":
+                    continue
+                info = obj.get("info") or {}
+                props = info.get("props") or {}
+                name = props.get("node.name", "")
+                if name not in active:
+                    continue
+                params = info.get("params") or {}
+                latency = params.get("Latency", []) or []
+                input_ns = None
+                for lat in latency:
+                    if (isinstance(lat, dict)
+                            and lat.get("direction") == "Input"):
+                        input_ns = lat.get("minNs")
+                        break
+                if input_ns is None:
+                    continue
+                self._history[name].append((now, int(input_ns)))
+            # Prune sinks that dropped out of the active set.
+            for n in list(self._history):
+                if n not in active:
+                    self._history.pop(n, None)
+                    self._exceed_count.pop(n, None)
+
+    def _maybe_resync(self):
+        active = set(self._graph.active_sinks())
+        master = self._graph._master_sink
+        now = time.time()
+        if now - self._last_resync_ts < self.RESYNC_COOLDOWN_S:
+            return
+        triggered = False
+        with self._lock:
+            for sink in active:
+                if sink == master:
+                    continue
+                info = self._compute_locked(sink, master)
+                if info is None:
+                    continue
+                if abs(info["offset_ms"]) >= DRIFT_RECOVER_MS:
+                    self._exceed_count[sink] += 1
+                    if self._exceed_count[sink] >= DRIFT_RECOVER_COUNT:
+                        triggered = True
+                        self._exceed_count[sink] = 0
+                else:
+                    self._exceed_count[sink] = 0
+        if triggered:
+            log.warning("drift monitor: hard resync (sustained offset ≥ "
+                        "%dms on a follower)", DRIFT_RECOVER_MS)
+            self._last_resync_ts = now
+            try:
+                self._graph._ensure_combine_sink(
+                    self._graph.active_sinks())
+                self._graph._offsets_fingerprint = None
+                self._graph._apply_offsets()
+            except Exception:
+                log.exception("resync attempt failed")
+
+    def _compute_locked(self, sink_name, master):
+        """Compute telemetry for one follower. Caller must hold _lock."""
+        hist = self._history.get(sink_name)
+        if not hist or len(hist) < 2:
+            return None
+        ts_list = [t for t, _ in hist]
+        lat_ms = [ns / 1_000_000.0 for _, ns in hist]
+        sorted_ms = sorted(lat_ms)
+        median = sorted_ms[len(sorted_ms) // 2]
+        current = lat_ms[-1]
+        offset_ms = current - median
+
+        jitter_ms = 0.0
+        if len(lat_ms) > 1:
+            mean = sum(lat_ms) / len(lat_ms)
+            jitter_ms = (sum((y - mean) ** 2 for y in lat_ms)
+                         / len(lat_ms)) ** 0.5
+
+        drift_ms_per_min = 0.0
+        if len(hist) >= 3:
+            t0 = ts_list[0]
+            xs = [t - t0 for t in ts_list]
+            ys = lat_ms
+            n = len(xs)
+            sx, sy = sum(xs), sum(ys)
+            sxy = sum(x * y for x, y in zip(xs, ys))
+            sxx = sum(x * x for x in xs)
+            denom = n * sxx - sx * sx
+            if denom > 0:
+                slope = (n * sxy - sx * sy) / denom
+                drift_ms_per_min = slope * 60.0
+
+        return {
+            "offset_ms": offset_ms,
+            "drift_ms_per_min": drift_ms_per_min,
+            "jitter_ms": jitter_ms,
+            "latency_ms": current,
+            "samples": len(hist),
+        }
 
     def get_sync_info(self, sink_name):
         master = self._graph._master_sink
@@ -704,14 +840,39 @@ class SyncMeasurer:
                 "confidence": 1.0,
                 "status": "reference",
             }
+        with self._lock:
+            info = self._compute_locked(sink_name, master)
+            exceed = self._exceed_count.get(sink_name, 0)
+        if info is None:
+            return {
+                "role": "follower",
+                "offset_ms": 0,
+                "drift_ms_per_min": 0,
+                "jitter_ms": 0,
+                "confidence": 0.0,
+                "status": "measuring",
+            }
+        offset = info["offset_ms"]
+        if abs(offset) >= DRIFT_RECOVER_MS:
+            status = "resyncing" if exceed >= DRIFT_RECOVER_COUNT - 1 else "degraded"
+        elif abs(offset) >= 5:
+            status = "degraded"
+        else:
+            status = "synced"
         return {
             "role": "follower",
-            "offset_ms": 0,
-            "drift_ms_per_min": 0,
-            "jitter_ms": 0,
-            "confidence": 0,
-            "status": "not_measured",
+            "offset_ms": round(offset, 1),
+            "drift_ms_per_min": round(info["drift_ms_per_min"], 2),
+            "jitter_ms": round(info["jitter_ms"], 2),
+            "latency_ms": round(info["latency_ms"], 1),
+            "confidence": 1.0,
+            "status": status,
+            "samples": info["samples"],
         }
+
+
+# Back-compat alias — main() still references SyncMeasurer.
+SyncMeasurer = DriftMonitor
 
 
 # ── PipeWireMonitor ──────────────────────────────────────────────────────────

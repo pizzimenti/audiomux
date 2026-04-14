@@ -217,9 +217,29 @@ Bench result (2026-04-14, analog + SoundCore-2 BT):
   analog=53 ms, BT=213 ms, both confidence 1.0, variance ±20 ms
   between warm runs — within the REDESIGN §8 goal 1 target.
 
-**Phase 3 — DriftMonitor** (2 days)
-New component consuming `pw-dump --monitor` for per-sink drift telemetry.
-Enabled by default. Publish in state JSON. Implement 5/50 ms policy.
+**Phase 3 — DriftMonitor** — **DONE**
+New `DriftMonitor` class (replaces the disabled 0.2.0 `SyncMeasurer`)
+samples each follower sink's `Params.Latency.Input.minNs` from `pw-dump`
+at `MEASURE_INTERVAL` (3 s). Tracks a rolling window per sink and
+computes current latency, offset from the window median (drift
+deviation), linear-regression slope (ms/minute), and jitter (stddev).
+Exposes in the state JSON as `sinks[].sync`, replacing the Phase-1
+placeholder. Passive — no mic, no audio interruption — so it's
+enabled by default and stays on.
+
+Hard-resync policy (mirrors Snapcast / Shairport): `|offset| < 5 ms`
+synced, `5 ms ≤ |offset| < 30 ms` degraded, `≥ 30 ms` for 3 consecutive
+polls → rebuild combine-sink (2 s cooldown).
+
+Scope adjustment: REDESIGN §3.3 originally planned to read
+`spa_io_rate_match` (driver's actual clock ratio) for ppm-level drift.
+That region isn't exposed via `pw-dump` — it's an internal SPA IO
+mapping. Using `Params.Latency` as a proxy gives us ms-level drift
+visibility, which is enough for the thresholds we actually act on. A
+future v2 could introspect the rate-match directly via libpipewire
+Python bindings for sub-ms detection. Bench validation: BT follower
+sampled 11 times over 30 s, latency steady at 145.2 ms, status
+`synced`, no spurious resyncs.
 
 **Phase 4 — Plasmoid update** (½ day)
 Live drift label; hide +/- buttons; rename Sync Delay → Calibrate;
