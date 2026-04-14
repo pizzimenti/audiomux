@@ -541,11 +541,21 @@ class GraphManager:
         if len(active) <= 1:
             # Narrowed to ≤1 sink — disengage. Either the user unchecked
             # everything but one, or the other sinks disappeared.
+            # Do NOT override the system default: when disengaged we
+            # simply track whatever the user/system has chosen. Pinning
+            # the default from `active[0]` would fight user clicks in
+            # the Plasma widget.
             with self._mutation_lock:
                 self._kill_all_loopbacks()
                 self._unload_null_sink()
-            if active:
-                pactl("set-default-sink", active[0])
+            if server.default_sink_name in sink_names:
+                # Adopt the live default into our saved state so the
+                # next reconcile doesn't see a stale active_sinks and
+                # behave surprisingly.
+                active = [server.default_sink_name]
+                self._saved["active_sinks"] = active
+                self._mark_dirty()
+                self.flush_state()
         else:
             with self._mutation_lock:
                 self._ensure_null_sink()
