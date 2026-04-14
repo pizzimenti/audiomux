@@ -1,6 +1,7 @@
-# AudioMux Sync Redesign — Design Document
+# AudioMux Sync Redesign
 
-_Working document for the `feat/sync-redesign` branch. Delete before merging to `main` (same convention as `FUTURE.md`)._
+_Working document for the `feat/sync-redesign` branch. Delete before merging
+to `main` (same convention as `FUTURE.md`)._
 
 ## 1. Why redesign
 
@@ -57,7 +58,7 @@ fallback, subprocess-isolated calibration (mic safety), adaptive resampling via
 
 One `module-combine-sink` loaded via `pactl` (PulseAudio-compat name; maps
 internally to PipeWire's combine-stream implementation and is the only way to
-load it into the running server — see `probes/RESULTS.md`):
+load it into the running server — see §6):
 
 ```
 pactl load-module module-combine-sink \
@@ -67,7 +68,7 @@ pactl load-module module-combine-sink \
 
 Probe 1 confirmed all backend stream nodes created by the combine share
 `node.driver-id` and `node.link-group`, giving us the single scheduling group
-DESIGN wanted.
+the design wanted.
 
 Each hardware sink's `Props.latencyOffsetNsec` carries the static path
 offset, set via `pw-cli set-param <id> Props '{ latencyOffsetNsec = N }'`.
@@ -113,7 +114,7 @@ did I tell PipeWire to play?" (unmeasurable). This approach asks "when did
 PipeWire actually emit the sample, per the monitor?" (directly observable).
 The circular dependency collapses.
 
-Fallback path (if simultaneous monitor capture is blocked — see §6):
+Fallback path (if BT codec-delay inclusion claim fails in Phase 2):
 orthogonal multi-tone. Emit 1 kHz / 2.5 kHz / 5 kHz simultaneously through the
 combine sink; compute per-tone arrival time at the mic via Goertzel;
 differential delays = offsets.
@@ -155,7 +156,7 @@ Minimal:
 bin/
   audiomux-syncd.py         # daemon: GraphOwner + DriftMonitor + SocketServer
   audiomux-source.py        # plasmoid backend (mostly unchanged)
-  audiomux_calibrate.py     # rewritten: sounddevice + GCC-PHAT, ~200 lines
+  audiomux_calibrate.py     # rewritten: parecord + GCC-PHAT, ~200 lines
   audiomux_sync_lib.py      # shared: GCC-PHAT, Goertzel (fallback), sweep gen
   audiomux-measure.py       # CLI diagnostic — wraps Calibrator
 plasmoid/
@@ -171,18 +172,16 @@ Rough LOC delta: **-400 / +250**.
 Each phase is a self-contained commit that leaves the branch runnable against
 the current plasmoid.
 
-**Phase 0 — branch setup and experiments** (~½ day)
-Three probe scripts answer the three open questions in §6. Don't touch daemon
-code yet.
+**Phase 0 — branch setup and experiments** (~½ day) — **DONE** (see §6).
 
 **Phase 1 — GraphOwner rewrite** (1–2 days)
-Replace `GraphManager` with a class that loads a single `module-combine-stream`
-and manages `combine.streams` + `latencyOffsetNsec`. Keep the existing offsets
-JSON schema initially. Remove `pw-loopback` spawning, `_loopback_procs`, legacy
+Replace `GraphManager` with a class that loads a single `module-combine-sink`
+and manages membership + `latencyOffsetNsec`. Keep the existing offsets JSON
+schema initially. Remove `pw-loopback` spawning, `_loopback_procs`, legacy
 cleanup, offset-flush-debounce. Drop `BT_COMPENSATION_MS`.
 
 **Phase 2 — Calibrator rewrite** (2 days)
-Rewrite `audiomux_calibrate.py`: one sweep + multi-channel capture + GCC-PHAT.
+Rewrite `audiomux_calibrate.py`: one sweep + parecord per source + GCC-PHAT.
 Drop the GStreamer path. Land orthogonal-multi-tone fallback behind
 `AUDIOMUX_CALIBRATE_METHOD=fallback`.
 
@@ -217,33 +216,91 @@ this file.
 - No breaking change to socket protocol; commands keep their names but gain
   optional fields.
 
-## 6. Open questions — all resolved in Phase 0
+## 6. Phase 0 probe results
 
-All three Phase-0 probes ran on 2026-04-13; results in `probes/RESULTS.md`.
+Three probe scripts live under `probes/`. They ran on 2026-04-13 against
+PipeWire 1.6.2 / WirePlumber 0.5.x on kernel 6.18.18-1-MANJARO with ALSA HDMI
+(pci-0000_03_00.1), ALSA analog (pci-0000_03_00.6), and BlueZ F4:4E:FC:E7:CA:8C
+present. They're preserved alongside this doc for anyone revisiting the
+decisions — rerun with `python3 probes/probeN_*.py`.
 
-1. **combine driver sharing:** Yes via `pactl load-module module-combine-sink`.
-   `pw-cli load-module` is **not** usable (loads into pw-cli process, dies on
-   exit).
-2. **latencyOffsetNsec live-editable:** Yes — zero delta, no relink, no audio
-   interruption.
-3. **Concurrent monitor capture:** Works. ~20 ms start jitter across parecord
-   processes but that doesn't affect GCC-PHAT because it's a sample-domain
-   correlation. No `sounddevice` dependency needed.
+| Probe | Script | Question | Verdict |
+|---|---|---|---|
+| 1 | `probes/probe1_combine_driver.py` | Does combine-stream give a single driver across backends? | **Yes**, via pactl's `module-combine-sink` name only |
+| 2 | `probes/probe2_latency_offset.py` | Is `Props.latencyOffsetNsec` live-editable? | **Yes**, zero delta, no relink |
+| 3 | `probes/probe3_multichannel_capture.py` | Can concurrent parecord captures stay aligned enough for GCC-PHAT? | **Yes**, ~20 ms start-jitter is irrelevant |
 
-Remaining risk for Phase 2 (not a Phase 1 blocker): the BT codec-delay
-inclusion claim — whether the BT monitor tap is actually upstream of codec
-packetization — was not testable because BT was suspended during probes.
-First Phase 2 integration test covers it.
+### Probe 1 — combine-stream driver sharing
+
+`pw-cli load-module` loads the module into the *pw-cli process itself* (per
+`man pw-cli`: "Modules are loaded and unloaded in the local instance, thus the
+pw-cli binary itself"). The sink it creates vanishes when `pw-cli` exits —
+unusable for a daemon that wants to put a combine into the running graph.
+
+`pactl load-module module-combine-sink sinks=a,b,c` loads into the running
+PipeWire server via its PulseAudio-compat shim and creates a persistent
+virtual sink. `pw-dump` after a 2-sink combine:
+
+```
+id=69  name=probe_cs3                                      driver-id=138  link-group=combine-sink-1494-13
+id=54  name=output.probe_cs3_...analog-stereo              driver-id=138  link-group=combine-sink-1494-13
+id=119 name=output.probe_cs3_..._bluez_output...           driver-id=138  link-group=combine-sink-1494-13
+```
+
+All three nodes (combine sink + both backend stream nodes) share
+`node.driver-id=138` and `node.link-group`. Hardware sinks remain on their own
+drivers — that's expected and is where adaptive resampling happens.
+
+**Design implication:** §3.1 uses `pactl module-combine-sink`, not
+`pw-cli module-combine-stream`.
+
+### Probe 2 — live-editable `latencyOffsetNsec`
+
+```
+set 10000000ns → rc=0  pw-dump reports 10000000   (delta 0.0 ms)
+set 50000000ns → rc=0  pw-dump reports 50000000   (delta 0.0 ms)
+set 100000000ns → rc=0 pw-dump reports 100000000  (delta 0.0 ms)
+set 0ns        → rc=0  pw-dump reports 0          (delta 0.0 ms)
+```
+
+All writes succeeded, `pw-dump` echoed exactly, no relink, no audio blip.
+`pw-loopback --delay` rebuilds (with the 800 ms debounce) go away.
+
+### Probe 3 — concurrent monitor capture
+
+Three concurrent parecords on three monitors produced files of:
+
+- 322560 bytes (HDMI monitor, 80640 stereo samples, 1.68 s)
+- 318720 bytes (analog monitor, 79680 stereo samples, 1.66 s)
+- 318720 bytes (BT monitor, 79680 stereo samples, 1.66 s)
+
+Only the analog monitor saw the emitted click (RMS=0.0349, detected at
+~350 ms) because HDMI/BT loopbacks were suspended at test time. The 20 ms
+file-size spread is parecord start-time jitter — doesn't affect GCC-PHAT
+because it's a sample-domain correlation: the peak position is the acoustic
+delay regardless of which sample index in each capture corresponds to which
+wall-clock time.
+
+**Design implication:** §3.2 uses `parecord` directly per source — no
+`python-sounddevice` dependency.
+
+### Remaining Phase-2 open question
+
+Whether the BT monitor tap is genuinely *upstream* of the codec packetization
+(so mic-vs-monitor delay captures the codec+radio buffer we care about) could
+not be tested because BT was suspended. First Phase-2 integration test covers
+it; fallback (orthogonal multi-tone for BT specifically) is already planned
+in §3.2.
 
 ## 7. Risks
 
 | Risk | Likelihood | Mitigation |
 |---|---|---|
-| PipeWire 1.6.2 combine-sink / latencyOffsetNsec don't compose as expected | ~~Medium~~ **Resolved** | Probes 1 + 2 confirmed both work independently. Probe that they compose will happen in Phase 1 first PR |
+| PipeWire 1.6.2 combine-sink / latencyOffsetNsec don't compose as expected | ~~Medium~~ **Resolved** | Probes 1 + 2 confirmed both work independently. Composition test lands in Phase 1's first PR |
 | BT monitor tap is downstream of codec on this BlueZ build | Medium | Phase-2 A/B test with BT resumed. If it fails, fall back to orthogonal multi-tone for BT only |
 | 50 ms hard-resync causes audible glitches on normal drift spikes (BT reconnect, Wi-Fi) | Medium | Require 3 consecutive samples over threshold. 2 s cooldown between resyncs. Log every event |
 | User has no microphone | Low | Calibrator detects, degrades to "manual offset mode" — +/- buttons return as fallback |
-| Combine-sink member set cannot be edited without reload | Medium | Single reload beats N loopback spawn/kills anyway, and the reload is scoped (other apps on other sinks unaffected). Accept the 100–300 ms gap on sink toggle |
+| Combine-sink member set cannot be edited without reload | Medium | Single reload beats N loopback spawn/kills anyway, and the reload is scoped. Accept the 100–300 ms gap on sink toggle |
 
 ## 8. Success criteria
 
