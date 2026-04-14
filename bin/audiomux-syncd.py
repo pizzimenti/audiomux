@@ -477,17 +477,19 @@ class GraphManager:
         self._known_sinks = set(sink_names)
         self._known_sources = set(source_names)
 
-        # If the user switched the system default to a real sink, collapse.
-        if (server.default_sink_name != VIRTUAL_SINK_NAME
-                and server.default_sink_name in sink_names):
-            self._saved["active_sinks"] = [server.default_sink_name]
-            self._kill_all_loopbacks()
-            self._mark_dirty()
-            self.flush_state()
-            return
-
         with self._mutation_lock:
             self._ensure_null_sink()
+
+        # Defend audiomux_virtual as the default sink. WirePlumber's
+        # rescue-on-connect policy auto-switches the default to newly-
+        # appeared BT sinks, and that shouldn't disarm audiomux — we own
+        # the default sink while we're running. If the user genuinely
+        # wants to step aside, the applet has an explicit Unbond action.
+        if (server.default_sink_name != VIRTUAL_SINK_NAME
+                and _has_sink(VIRTUAL_SINK_NAME)):
+            log.info("reasserting default sink to %s (was %s)",
+                     VIRTUAL_SINK_NAME, server.default_sink_name)
+            pactl("set-default-sink", VIRTUAL_SINK_NAME)
 
         active = [
             n for n in (self._saved.get("active_sinks") or [])
