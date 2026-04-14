@@ -561,3 +561,104 @@ def calibrate_all(sink_names, mic_device, freq_assignment=None, rate=RATE):
         "freq_assignment": freq_assignment or {},
     }], mic_device, rate=rate)
     return rounds[0] if rounds else {}
+
+
+# ── Phase 2: GCC-PHAT calibration helpers ────────────────────────────────────
+
+def _require_numpy():
+    try:
+        import numpy as np
+        return np
+    except ImportError as e:
+        raise RuntimeError(
+            "numpy is required for GCC-PHAT calibration "
+            "(install with: python3 -m pip install --user numpy)"
+        ) from e
+
+
+def gen_log_sweep(duration_s=1.0, f0=80.0, f1=8000.0,
+                  rate=RATE, amplitude=0.6, fade_ms=10.0):
+    """Log-chirp (Farina method).
+
+    Returns a 1-D float32 numpy array in [-1, 1]. Endpoints are faded to
+    avoid transients.
+    """
+    np = _require_numpy()
+    n = int(rate * duration_s)
+    t = np.arange(n, dtype=np.float64) / rate
+    k = math.log(f1 / f0) / duration_s
+    phase = 2.0 * math.pi * f0 * (np.exp(k * t) - 1.0) / k
+    y = amplitude * np.sin(phase)
+    fade = max(1, int(rate * fade_ms / 1000.0))
+    if fade * 2 < n:
+        y[:fade] *= np.linspace(0.0, 1.0, fade)
+        y[-fade:] *= np.linspace(1.0, 0.0, fade)
+    return y.astype(np.float32)
+
+
+def float_mono_to_s16_stereo_bytes(mono_float):
+    """Pack a mono float32 signal as stereo S16LE interleaved bytes."""
+    np = _require_numpy()
+    s = np.clip(mono_float * 32767.0, -32768, 32767).astype(np.int16)
+    stereo = np.repeat(s[:, None], 2, axis=1).ravel()
+    return stereo.tobytes()
+
+
+def raw_s16le_stereo_to_mono(path):
+    """Load a raw S16LE stereo file and return mono float32 in [-1, 1]."""
+    np = _require_numpy()
+    data = np.fromfile(path, dtype=np.int16)
+    if data.size == 0:
+        return np.zeros(0, dtype=np.float32)
+    if data.size % 2:
+        data = data[:-1]
+    data = data.reshape(-1, 2).astype(np.float32)
+    return (data[:, 0] + data[:, 1]) * (0.5 / 32768.0)
+
+
+def gcc_phat(a, b, max_lag_samples=None, eps=1e-12):
+    """Generalized Cross-Correlation with PHAse Transform.
+
+    Returns (lag_samples, peak_ratio). Sign convention (empirical, see
+    `probes/` synthetic test): positive `lag` means `b` arrived EARLIER
+    than `a` by `lag` samples — so `a` is the lagged one.
+
+    For mic-vs-monitor, the natural call is
+        lag, conf = gcc_phat(mic, monitor)
+    which returns positive `lag` = acoustic arrival delay at the mic
+    (monitor emits, mic hears it `lag` samples later).
+
+    peak_ratio is the correlation peak magnitude divided by the mean
+    absolute value of the full centered correlation window; larger =
+    more confident. With clean log-sweep signals peak_ratio easily
+    exceeds 10⁴; with silence it degenerates toward 1.
+    """
+    np = _require_numpy()
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+    if a.size == 0 or b.size == 0:
+        return 0, 0.0
+    n = a.size + b.size
+    nfft = 1 << (n - 1).bit_length()
+    A = np.fft.rfft(a, n=nfft)
+    B = np.fft.rfft(b, n=nfft)
+    R = A * np.conj(B)
+    R /= np.abs(R) + eps
+    cc = np.fft.irfft(R, n=nfft).astype(np.float32)
+    half = nfft // 2
+    cc_centered = np.concatenate([cc[-half:], cc[:half + 1]])
+    center = half
+    if max_lag_samples is not None:
+        lo = max(0, center - max_lag_samples)
+        hi = min(cc_centered.size, center + max_lag_samples + 1)
+        window = cc_centered[lo:hi]
+        peak_idx_local = int(np.argmax(np.abs(window)))
+        lag = peak_idx_local + lo - center
+        peak_val = float(window[peak_idx_local])
+    else:
+        peak_idx = int(np.argmax(np.abs(cc_centered)))
+        lag = peak_idx - center
+        peak_val = float(cc_centered[peak_idx])
+    mean_abs = float(np.mean(np.abs(cc_centered))) + eps
+    peak_ratio = float(abs(peak_val) / mean_abs)
+    return lag, peak_ratio

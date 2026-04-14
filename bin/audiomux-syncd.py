@@ -128,12 +128,19 @@ def _has_sink(name):
     return False
 
 
-def _live_combine_module_id():
-    """Find a currently-loaded module-combine-sink for VIRTUAL_SINK_NAME."""
+def _live_combine_module_ids():
+    """Return every currently-loaded module-combine-sink for VIRTUAL_SINK_NAME.
+
+    Returns a list — in normal operation it's length 0 or 1, but duplicates
+    can accumulate if the daemon crashes mid-reload or if a pactl race
+    slips one past the unload. Callers should pick the first for "is one
+    live?" checks and unload all on migration/cleanup.
+    """
     result = subprocess.run(
         ["pactl", "list", "modules", "short"],
         capture_output=True, text=True,
     )
+    ids = []
     for line in result.stdout.splitlines():
         parts = line.split(None, 2)
         if len(parts) < 2 or not parts[0].isdigit():
@@ -142,8 +149,13 @@ def _live_combine_module_id():
             continue
         args = parts[2] if len(parts) >= 3 else ""
         if f"sink_name={VIRTUAL_SINK_NAME}" in args:
-            return int(parts[0])
-    return None
+            ids.append(int(parts[0]))
+    return ids
+
+
+def _live_combine_module_id():
+    ids = _live_combine_module_ids()
+    return ids[0] if ids else None
 
 
 def _live_null_sink_module_id():
@@ -264,9 +276,11 @@ class GraphManager:
         self._state_dirty = True
         self._sync_measurer = None
         self._reconciling = False
+        self._calibrating = False  # set by SocketServer around check-sync
         self._state_cache = None
         self._state_cache_time = 0
         self._offsets_fingerprint = None  # (tuple(active_sinks), offsets_dict_tuple)
+        self._mutation_lock = threading.Lock()  # serialises combine-sink load/unload
 
     # ── persistent state ─────────────────────────────────────────────────
 
@@ -329,10 +343,9 @@ class GraphManager:
         return True
 
     def _unload_combine_sink(self):
-        live = _live_combine_module_id()
-        if live is not None:
-            pactl("unload-module", str(live))
-            log.info("unloaded combine-sink id=%d", live)
+        for mid in _live_combine_module_ids():
+            pactl("unload-module", str(mid))
+            log.info("unloaded combine-sink id=%d", mid)
         self._combine_module_id = None
         self._saved["combine_module_id"] = None
         self._mark_dirty()
@@ -341,24 +354,30 @@ class GraphManager:
         """Make the live combine-sink's membership match `desired_sinks`.
 
         No-op when already correct. Reloads when membership changes.
+        Held under `_mutation_lock` so concurrent callers (reconcile from the
+        pw-dump monitor + set_active_sinks from the socket) can't both load
+        a combine-sink at the same time.
         """
         desired = sorted(set(desired_sinks))
-        live_id = _live_combine_module_id()
+        with self._mutation_lock:
+            live_ids = _live_combine_module_ids()
 
-        if not desired:
-            if live_id is not None:
-                self._unload_combine_sink()
-            return
-
-        if live_id is not None:
-            current = sorted(_combine_member_sinks(live_id))
-            if current == desired:
-                self._combine_module_id = live_id
-                self._saved["combine_module_id"] = live_id
+            if not desired:
+                if live_ids:
+                    self._unload_combine_sink()
                 return
-            self._unload_combine_sink()
 
-        self._load_combine_sink(desired)
+            if len(live_ids) == 1:
+                current = sorted(_combine_member_sinks(live_ids[0]))
+                if current == desired:
+                    self._combine_module_id = live_ids[0]
+                    self._saved["combine_module_id"] = live_ids[0]
+                    return
+
+            # Either >1 duplicates live, or membership drifted. Clean slate.
+            if live_ids:
+                self._unload_combine_sink()
+            self._load_combine_sink(desired)
 
     # ── offset application ───────────────────────────────────────────────
 
@@ -422,7 +441,7 @@ class GraphManager:
     # ── reconciliation ───────────────────────────────────────────────────
 
     def reconcile(self):
-        if self._reconciling:
+        if self._reconciling or self._calibrating:
             return
         self._reconciling = True
         try:
@@ -942,6 +961,7 @@ class SocketServer:
         GCC-PHAT between mic and sink monitors — see REDESIGN.md §3.2.
         """
         self._calibration_in_progress = True
+        self._graph._calibrating = True
         try:
             active = list(self._graph.active_sinks())
             if len(active) < 2:
@@ -957,13 +977,17 @@ class SocketServer:
             log.info("calibration: starting subprocess (mic=%s, sinks=%s)",
                      mic, sinks)
 
-            # Tear down the combine so the calibrator plays straight to each
-            # hardware sink without interference. Zero out latency offsets so
-            # we measure raw hardware delay, not compensated delay.
+            # Phase 2 calibrator plays sweeps *directly* to each hardware
+            # sink (sequentially, one at a time, to avoid acoustic crosstalk
+            # between speakers). Tear the combine-sink down so any user
+            # audio playing to audiomux_virtual can't bleed into the
+            # measurement, and zero out each sink's latencyOffsetNsec so we
+            # measure raw hardware delay rather than already-compensated.
             self._graph._unload_combine_sink()
             dump = _pw_dump()
             for sn in sinks:
                 self._graph._clear_offset_for(sn, dump)
+            self._graph._offsets_fingerprint = None
 
             # Build tone specs
             n_tones = min(8, len(CALIBRATE_FREQS))
@@ -1006,9 +1030,15 @@ class SocketServer:
                 cal_error = str(e)
                 log.exception("calibration subprocess failed")
 
-            # Always restore the graph.
+            # Always restore the graph. A reconcile may have fired while
+            # the combine-sink was unloaded and collapsed active_sinks —
+            # reassert the full set here.
             log.info("calibration: restoring combine-sink")
+            self._graph._saved["active_sinks"] = list(sinks)
+            self._graph._mark_dirty()
+            self._graph.flush_state()
             self._graph._ensure_combine_sink(sinks)
+            self._graph._offsets_fingerprint = None
             self._graph._apply_offsets()
 
             if cal_error:
@@ -1074,6 +1104,7 @@ class SocketServer:
             return {"ok": True, "mic": mic, "results": results}
         finally:
             self._calibration_in_progress = False
+            self._graph._calibrating = False
 
 
 # ── main ─────────────────────────────────────────────────────────────────────

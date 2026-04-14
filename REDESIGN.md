@@ -189,10 +189,33 @@ is now fingerprinted — no-op when `(active_sinks, offsets)` is unchanged,
 which silences the per-pw-dump-event reconcile spam the 0.2.0 daemon masked
 by doing nothing in that path.
 
-**Phase 2 — Calibrator rewrite** (2 days)
-Rewrite `audiomux_calibrate.py`: one sweep + parecord per source + GCC-PHAT.
-Drop the GStreamer path. Land orthogonal-multi-tone fallback behind
-`AUDIOMUX_CALIBRATE_METHOD=fallback`.
+**Phase 2 — Calibrator rewrite** — **DONE**
+Rewrote `audiomux_calibrate.py` around GCC-PHAT (`audiomux_sync_lib.py`
+`gcc_phat`, `gen_log_sweep`, `float_mono_to_s16_stereo_bytes`,
+`raw_s16le_stereo_to_mono`). Dropped the GStreamer path. Several Phase-2
+discoveries (see §9):
+
+- `pw-cat` can't read raw PCM from stdin (libsndfile-based); use
+  `paplay --raw`.
+- Simultaneous playout through combine causes acoustic crosstalk: loudest
+  speaker dominates the mic, and since combine-sink feeds all backend
+  monitors with a time-aligned stream, GCC-PHAT locks onto that peak for
+  every sink. Fix: sequential per-sink playout via `paplay --device`.
+- BT sinks go idle between sequential measurements; first measurement
+  after wake-up adds 50–200 ms of codec/link warmup. Fix: 1.5 s silent
+  warmup (-60 dBFS dither) before each per-sink sweep.
+- Two concurrent `_ensure_combine_sink` callers (reconcile + socket
+  dispatch) can both end up loading a module before either's unload
+  finishes → pile-up. Fix: `threading.Lock` around the load/unload, and
+  `_live_combine_module_ids()` (plural) so cleanup kills all duplicates.
+- pw-dump events during calibration fire `reconcile()`, whose "default
+  sink moved away" path collapses `active_sinks` to a single entry. Fix:
+  `GraphManager._calibrating` guard that short-circuits reconcile, plus
+  an explicit reassert of `active_sinks` in the calibration restore step.
+
+Bench result (2026-04-14, analog + SoundCore-2 BT):
+  analog=53 ms, BT=213 ms, both confidence 1.0, variance ±20 ms
+  between warm runs — within the REDESIGN §8 goal 1 target.
 
 **Phase 3 — DriftMonitor** (2 days)
 New component consuming `pw-dump --monitor` for per-sink drift telemetry.
