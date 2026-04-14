@@ -264,6 +264,7 @@ class GraphManager:
         self._mutation_lock = threading.Lock()
         self._known_sinks = set()    # for hotplug logging
         self._known_sources = set()  # for hotplug logging
+        self._last_hotplug_at = 0.0  # last time a new sink appeared
 
     # ── persistent state ─────────────────────────────────────────────────
 
@@ -299,6 +300,14 @@ class GraphManager:
         self._state_dirty = False
 
     # ── null-sink lifecycle ──────────────────────────────────────────────
+
+    def _unload_null_sink(self):
+        for mid in _live_null_sink_module_ids():
+            pactl("unload-module", str(mid))
+            log.info("unloaded null-sink id=%d", mid)
+        self._null_sink_module_id = None
+        self._saved["null_sink_module_id"] = None
+        self._mark_dirty()
 
     def _ensure_null_sink(self):
         ids = _live_null_sink_module_ids()
@@ -465,8 +474,11 @@ class GraphManager:
         # Hotplug logging — surface new/removed devices. Useful when
         # watching BT speakers connect / disconnect during beta testing.
         if self._known_sinks:
-            for sn in sorted(sink_names - self._known_sinks):
+            new_sinks = sink_names - self._known_sinks
+            for sn in sorted(new_sinks):
                 log.info("hotplug: new sink appeared: %s", sn)
+            if new_sinks:
+                self._last_hotplug_at = time.time()
             for sn in sorted(self._known_sinks - sink_names):
                 log.info("hotplug: sink disappeared: %s", sn)
         if self._known_sources:
@@ -477,19 +489,31 @@ class GraphManager:
         self._known_sinks = set(sink_names)
         self._known_sources = set(source_names)
 
-        with self._mutation_lock:
-            self._ensure_null_sink()
-
-        # Defend audiomux_virtual as the default sink. WirePlumber's
-        # rescue-on-connect policy auto-switches the default to newly-
-        # appeared BT sinks, and that shouldn't disarm audiomux — we own
-        # the default sink while we're running. If the user genuinely
-        # wants to step aside, the applet has an explicit Unbond action.
+        # If the system default is a real sink (not audiomux_virtual)
+        # and we aren't in the middle of a hotplug, it's a user-
+        # initiated switch — disengage entirely.
+        _REASSERT_WINDOW_S = 10.0
         if (server.default_sink_name != VIRTUAL_SINK_NAME
+                and server.default_sink_name in sink_names
                 and _has_sink(VIRTUAL_SINK_NAME)):
-            log.info("reasserting default sink to %s (was %s)",
-                     VIRTUAL_SINK_NAME, server.default_sink_name)
-            pactl("set-default-sink", VIRTUAL_SINK_NAME)
+            since_hotplug = time.time() - self._last_hotplug_at
+            if since_hotplug < _REASSERT_WINDOW_S:
+                log.info("reasserting default sink to %s (was %s, "
+                         "%.1fs after hotplug)",
+                         VIRTUAL_SINK_NAME,
+                         server.default_sink_name, since_hotplug)
+                pactl("set-default-sink", VIRTUAL_SINK_NAME)
+            else:
+                log.info("user chose %s as default (%.1fs since last "
+                         "hotplug); disengaging audiomux",
+                         server.default_sink_name, since_hotplug)
+                with self._mutation_lock:
+                    self._kill_all_loopbacks()
+                    self._unload_null_sink()
+                self._saved["active_sinks"] = [server.default_sink_name]
+                self._mark_dirty()
+                self.flush_state()
+                return
 
         active = [
             n for n in (self._saved.get("active_sinks") or [])
@@ -514,8 +538,18 @@ class GraphManager:
         self._mark_dirty()
         self.flush_state()
 
-        with self._mutation_lock:
-            self._ensure_loopbacks()
+        if len(active) <= 1:
+            # Narrowed to ≤1 sink — disengage. Either the user unchecked
+            # everything but one, or the other sinks disappeared.
+            with self._mutation_lock:
+                self._kill_all_loopbacks()
+                self._unload_null_sink()
+            if active:
+                pactl("set-default-sink", active[0])
+        else:
+            with self._mutation_lock:
+                self._ensure_null_sink()
+                self._ensure_loopbacks()
 
         self._master_sink = self._resolve_master(set(active))
 
@@ -623,9 +657,21 @@ class GraphManager:
         self._saved["active_sinks"] = names
         self._mark_dirty()
         self.flush_state()
-        with self._mutation_lock:
-            self._ensure_null_sink()
-            self._ensure_loopbacks()
+
+        # Engage only when we're actually multiplexing. With ≤1 active
+        # sink there's nothing to mux — pointless to insert null-sink +
+        # loopback into the path, and "AudioMux" shouldn't clutter the
+        # Plasma sink list when it isn't doing anything.
+        if len(names) <= 1:
+            with self._mutation_lock:
+                self._kill_all_loopbacks()
+                self._unload_null_sink()
+            if names:
+                pactl("set-default-sink", names[0])
+        else:
+            with self._mutation_lock:
+                self._ensure_null_sink()
+                self._ensure_loopbacks()
         self._master_sink = self._resolve_master(set(names))
 
     def set_active_sources(self, names):
