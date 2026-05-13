@@ -20,6 +20,11 @@ PlasmoidItem {
     property var pendingSourceOffsets: ({})
     readonly property int pendingOffsetTimeoutMs: 3000
 
+    // Phase 4: manual +/- offset buttons are hidden by default — calibration
+    // now produces reliable offsets so manual nudging is an advanced escape
+    // hatch rather than a first-class tool. Set true to show.
+    property bool showManualOffsets: false
+
     property var sinks: []
     property var sources: []
     property string masterSink: ""
@@ -162,7 +167,7 @@ PlasmoidItem {
                     }
 
                     PC3.Button {
-                        text: root.syncChecking ? "Syncing…" : "Sync Delay"
+                        text: root.syncChecking ? "Calibrating…" : "Calibrate"
                         icon.name: "chronometer"
                         enabled: !root.syncChecking && root.sinks.filter(s => s.active).length > 1
                         onClicked: {
@@ -251,6 +256,30 @@ PlasmoidItem {
                         font.italic: true
                     }
 
+                    // Live drift status — populated by DriftMonitor (Phase 3).
+                    // Only shown for active followers; master is implied by the
+                    // "master" label to the left.
+                    PC3.Label {
+                        readonly property var sync: modelData.sync || {}
+                        readonly property string status: sync.status || ""
+                        readonly property real offset: sync.offset_ms || 0
+                        visible: modelData.active && modelData.role === "follower" && status
+                        text: {
+                            if (status === "synced") return "synced"
+                            if (status === "measuring") return "measuring…"
+                            if (status === "degraded" || status === "resyncing")
+                                return (offset >= 0 ? "+" : "") + offset.toFixed(0) + "ms"
+                            return status
+                        }
+                        font.pointSize: Kirigami.Theme.smallFont.pointSize
+                        color: {
+                            if (status === "synced") return Kirigami.Theme.positiveTextColor
+                            if (status === "degraded") return Kirigami.Theme.neutralTextColor
+                            if (status === "resyncing") return Kirigami.Theme.negativeTextColor
+                            return Kirigami.Theme.disabledTextColor
+                        }
+                    }
+
                     PC3.Slider {
                         id: sinkSlider
                         Layout.preferredWidth: Kirigami.Units.gridUnit * 7
@@ -276,6 +305,7 @@ PlasmoidItem {
                     }
 
                     PC3.Button {
+                        visible: root.showManualOffsets
                         text: "\u2212"
                         implicitWidth: Kirigami.Units.gridUnit * 1.4
                         enabled: modelData.offset > 0
@@ -283,6 +313,7 @@ PlasmoidItem {
                     }
 
                     PC3.Label {
+                        visible: root.showManualOffsets
                         Layout.preferredWidth: Kirigami.Units.gridUnit * 2.8
                         text: (modelData.offset > 0 ? "+" : "") + modelData.offset + "ms"
                         horizontalAlignment: Text.AlignHCenter
@@ -291,6 +322,7 @@ PlasmoidItem {
                     }
 
                     PC3.Button {
+                        visible: root.showManualOffsets
                         text: "+"
                         implicitWidth: Kirigami.Units.gridUnit * 1.4
                         onClicked: root.onSinkOffset(modelData.name, modelData.offset + 15)

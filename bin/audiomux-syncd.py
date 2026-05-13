@@ -5,12 +5,25 @@ audiomux-syncd — AudioMux sync daemon
 Long-running service that owns the PipeWire routing graph and exposes
 state to the plasmoid via a runtime JSON file and a Unix domain socket.
 
-Replaces the stateless per-invocation graph management that was previously
-done directly by audiomux-source.py.
+Graph shape (post-Phase-1-revert):
 
-Loopbacks are created via pw-loopback (PipeWire-native, adaptive resampling
-enabled by default) instead of pactl load-module module-loopback (PulseAudio
-compat, resampling disabled).
+  * One `module-null-sink` named `audiomux_virtual` — the virtual sink
+    the rest of the system treats as default. This is the 0.2.0 shape,
+    chosen after the first attempt at using `module-combine-sink` +
+    `Props.latencyOffsetNsec` turned out to be broken: `latencyOffsetNsec`
+    is a reporting-only hint in PipeWire (confirmed by bench mic test on
+    2026-04-14 — setting 500 ms shifted mic arrival by 45 ms, pure
+    jitter). Only `pw-loopback --delay` actually buffers samples.
+  * One `pw-loopback` child process per active hardware sink, each with
+    its own `--delay` computed from calibration. The slowest sink is the
+    baseline (0 ms added); faster sinks get positive delay to align.
+
+Sink-set changes → add/remove loopback processes (no audio disruption to
+existing sinks). Offset changes → respawn the affected loopbacks (brief
+gap on that one sink during respawn; the others keep playing). The
+Phase-2 GCC-PHAT calibrator and the Phase-3 DriftMonitor (passive
+Params.Latency-based telemetry) are unchanged — only the delay-apply
+mechanism changed.
 """
 
 import asyncio
@@ -27,7 +40,6 @@ import time
 
 import pulsectl
 
-# Shared measurement library (same directory)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from audiomux_sync_lib import (
     record_monitor, downsample, is_silence, xcorr_offset, lag_to_ms,
@@ -36,10 +48,13 @@ from audiomux_sync_lib import (
 
 # ── constants ────────────────────────────────────────────────────────────────
 
+DAEMON_VERSION      = "0.3.0"
+
 PRIMARY_SINK        = "alsa_output.pci-0000_03_00.6.analog-stereo"
 PRIMARY_SOURCE      = "alsa_input.pci-0000_03_00.6.analog-stereo"
 VIRTUAL_SINK_NAME   = "audiomux_virtual"
 COMBINE_SOURCE_NAME = "audiomux_combined_source"
+LOOPBACK_NAME_PREFIX = "audiomux_lb_"
 
 _UID               = os.getuid()
 RUN_DIR            = f"/run/user/{_UID}"
@@ -48,17 +63,16 @@ INTERNAL_STATE     = f"{RUN_DIR}/audiomux-syncd.json"   # daemon internal state
 SOCKET_PATH        = f"{RUN_DIR}/audiomux-syncd.sock"
 OFFSETS_FILE       = os.path.expanduser("~/.config/audiomux-offsets.json")
 
-BASE_LATENCY_MS    = 50    # pw-loopback buffer (much lower than legacy 200ms)
-BT_COMPENSATION_MS = int(os.environ.get("AUDIOMUX_BT_COMPENSATION_MS", "0"))
+BASE_LATENCY_MS    = 50    # pw-loopback buffer — same as 0.2.0
 RECONCILE_INTERVAL = 30    # seconds between full reconciliation sweeps
 
-# Sync measurement
-MEASURE_INTERVAL   = 3     # seconds between measurements
-MEASURE_DURATION   = 0.5   # seconds of audio to capture per measurement
-MEASURE_WINDOW     = 20    # rolling window size (20 × 3s = 60s of history)
-DRIFT_RECOVER_MS   = 30    # rebuild loopback if offset exceeds this for N cycles
-DRIFT_RECOVER_COUNT = 3    # consecutive exceeded measurements before recovery
-JUMP_THRESHOLD_MS  = 50    # immediate rebuild if offset jumps this much in one cycle
+# Drift measurement (passive, from pw-dump Params.Latency)
+MEASURE_INTERVAL   = 3
+MEASURE_DURATION   = 0.5
+MEASURE_WINDOW     = 20
+DRIFT_RECOVER_MS   = 30
+DRIFT_RECOVER_COUNT = 3
+JUMP_THRESHOLD_MS  = 50
 
 log = logging.getLogger("audiomux-syncd")
 
@@ -100,61 +114,6 @@ def save_offsets(offsets):
         json.dump(offsets, f, indent=2)
 
 
-# ── graph queries ────────────────────────────────────────────────────────────
-
-def _has_virtual_sink():
-    result = subprocess.run(
-        ["pactl", "list", "sinks", "short"],
-        capture_output=True, text=True,
-    )
-    for line in result.stdout.splitlines():
-        parts = line.split()
-        if len(parts) > 1 and parts[1] == VIRTUAL_SINK_NAME:
-            return True
-    return False
-
-
-def _live_virtual_sink_module_id():
-    result = subprocess.run(
-        ["pactl", "list", "modules", "short"],
-        capture_output=True, text=True,
-    )
-    for line in result.stdout.splitlines():
-        if "module-null-sink" not in line:
-            continue
-        if f"sink_name={VIRTUAL_SINK_NAME}" not in line:
-            continue
-        parts = line.split()
-        if parts and parts[0].isdigit():
-            return int(parts[0])
-    return None
-
-
-def _live_pactl_loopback_modules():
-    """Return {sink_name: module_id} for legacy pactl loopbacks.
-
-    Used during migration to clean up old-style loopbacks.
-    """
-    result = subprocess.run(
-        ["pactl", "list", "modules", "short"],
-        capture_output=True, text=True,
-    )
-    modules = {}
-    for line in result.stdout.splitlines():
-        if "module-loopback" not in line:
-            continue
-        if f"source={VIRTUAL_SINK_NAME}.monitor" not in line:
-            continue
-        parts = line.split()
-        if not parts or not parts[0].isdigit():
-            continue
-        module_id = int(parts[0])
-        for part in parts:
-            if part.startswith("sink="):
-                modules[part[5:]] = module_id
-    return modules
-
-
 def _preferred_name(primary, available, fallback=None):
     if primary in available:
         return primary
@@ -163,42 +122,202 @@ def _preferred_name(primary, available, fallback=None):
     return next(iter(available), None)
 
 
+def _safe_name(sink_name):
+    return sink_name.replace(".", "_").replace(":", "_")
+
+
+# ── graph queries ────────────────────────────────────────────────────────────
+
+def _has_sink(name):
+    result = subprocess.run(
+        ["pactl", "list", "sinks", "short"],
+        capture_output=True, text=True,
+    )
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) > 1 and parts[1] == name:
+            return True
+    return False
+
+
+def _live_null_sink_module_ids():
+    """Return all module-null-sink modules whose sink_name == VIRTUAL_SINK_NAME."""
+    result = subprocess.run(
+        ["pactl", "list", "modules", "short"],
+        capture_output=True, text=True,
+    )
+    ids = []
+    for line in result.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 2 or not parts[0].isdigit():
+            continue
+        if parts[1] != "module-null-sink":
+            continue
+        args = parts[2] if len(parts) >= 3 else ""
+        if f"sink_name={VIRTUAL_SINK_NAME}" in args:
+            ids.append(int(parts[0]))
+    return ids
+
+
+def _live_combine_sink_module_ids():
+    """Phase-1 leftovers: module-combine-sink with our VIRTUAL_SINK_NAME."""
+    result = subprocess.run(
+        ["pactl", "list", "modules", "short"],
+        capture_output=True, text=True,
+    )
+    ids = []
+    for line in result.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 2 or not parts[0].isdigit():
+            continue
+        if parts[1] != "module-combine-sink":
+            continue
+        args = parts[2] if len(parts) >= 3 else ""
+        if f"sink_name={VIRTUAL_SINK_NAME}" in args:
+            ids.append(int(parts[0]))
+    return ids
+
+
+def _pw_dump():
+    result = subprocess.run(["pw-dump"], capture_output=True, text=True)
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+
+
+def _find_sink_node_id(sink_name, dump=None):
+    if dump is None:
+        dump = _pw_dump()
+    for obj in dump:
+        if obj.get("type") != "PipeWire:Interface:Node":
+            continue
+        props = (obj.get("info") or {}).get("props") or {}
+        if props.get("node.name") == sink_name:
+            return obj.get("id")
+    return None
+
+
+def _pw_clear_latency_offset(node_id):
+    """Zero out any stale Props.latencyOffsetNsec on a hardware sink node.
+
+    The short-lived Phase-1 code wrote non-zero values here; the
+    compensation is now done via pw-loopback --delay, so we need the
+    reporting hint to be zero again or latency-aware apps will back-time
+    media by the wrong amount.
+    """
+    if node_id is None:
+        return
+    subprocess.run(
+        ["pw-cli", "set-param", str(node_id), "Props",
+         "{ latencyOffsetNsec = 0 }"],
+        capture_output=True, text=True,
+    )
+
+
+def _probe_single_instance():
+    """Refuse to start if another daemon already owns SOCKET_PATH.
+
+    Has to run BEFORE _kill_orphan_loopbacks, otherwise an accidental
+    second daemon would terminate the live instance's pw-loopback
+    children before discovering the socket is in use and exiting.
+    """
+    if not os.path.exists(SOCKET_PATH):
+        return
+    import socket
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.connect(SOCKET_PATH)
+        log.error("another audiomux-syncd is already running")
+        sys.exit(1)
+    except ConnectionRefusedError:
+        log.info("removing stale socket %s", SOCKET_PATH)
+        os.unlink(SOCKET_PATH)
+    except FileNotFoundError:
+        pass
+    finally:
+        sock.close()
+
+
+def _kill_orphan_loopbacks(owned_pids=()):
+    """Terminate stray `pw-loopback` processes we don't own — e.g. leftovers
+    from a crashed previous daemon. Scoped to the current user so we
+    never touch another user's session on a shared box."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-af", "-u", str(_UID),
+             f"pw-loopback.*{LOOPBACK_NAME_PREFIX}"],
+            capture_output=True, text=True,
+        )
+    except FileNotFoundError:
+        return
+    owned = set(owned_pids)
+    for line in result.stdout.splitlines():
+        pid_s = line.split(None, 1)[0]
+        if not pid_s.isdigit():
+            continue
+        pid = int(pid_s)
+        if pid in owned:
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+            log.info("migration: killed orphan pw-loopback pid=%d", pid)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            # Belt-and-suspenders: -u $UID above should already exclude
+            # other users' processes, but a misconfigured pgrep build or
+            # a setuid'd descendant could still leak through. Skip
+            # rather than abort daemon startup.
+            log.info("migration: skip pw-loopback pid=%d (not ours)", pid)
+
+
 # ── GraphManager ─────────────────────────────────────────────────────────────
 
 class GraphManager:
-    """Owns the PipeWire routing graph: virtual sink, loopbacks, sources.
+    """Owns the PipeWire routing graph: null-sink + per-sink pw-loopback.
 
-    Loopbacks are managed as pw-loopback child processes.  When the daemon
-    stops, all loopback processes are terminated — the daemon owns the graph.
+    Sink-set changes → spawn/kill individual loopbacks (non-disruptive to
+    sinks that are keeping their state). Offset changes → respawn just the
+    affected loopback(s). Calibration → kill all loopbacks, run subprocess
+    against the bare hardware sinks, rebuild loopbacks with new delays.
     """
 
     def __init__(self):
         self._saved = self._load_saved()
+        self._null_sink_module_id = None
         self._loopback_procs = {}   # {sink_name: subprocess.Popen}
+        self._loopback_delays = {}  # {sink_name: delay_ms the loopback was spawned with}
         self._master_sink = None
         self._state_dirty = True
-        self._sync_measurer = None  # set after SyncMeasurer is created
-        self._reconciling = False   # re-entry guard
-        self._legacy_cleaned = False
-        self._pending_offset_rebuilds = {}  # {sink_name: timestamp}
-        self._state_cache = None            # cached get_state_json result
-        self._state_cache_time = 0          # when cache was last built
+        self._sync_measurer = None
+        self._reconciling = False
+        self._calibrating = False
+        self._state_cache = None
+        self._state_cache_time = 0
+        self._mutation_lock = threading.Lock()
+        self._known_sinks = set()    # for hotplug logging
+        self._known_sources = set()  # for hotplug logging
+        self._last_hotplug_at = 0.0  # last time a new sink appeared
 
-    # ── saved state (persisted across daemon restarts) ───────────────────
+    # ── persistent state ─────────────────────────────────────────────────
 
     @staticmethod
     def _load_saved():
-        # Try daemon-specific state first, fall back to legacy state file
         for path in (INTERNAL_STATE, STATE_FILE):
             try:
                 with open(path) as f:
                     data = json.load(f)
-                if "active_sinks" in data or "virtual_sink_module_id" in data:
+                if "active_sinks" in data:
+                    for legacy in ("virtual_sink_module_id",
+                                    "loopback_modules",
+                                    "combine_module_id"):
+                        data.pop(legacy, None)
                     return data
             except Exception:
                 pass
         return {
-            "virtual_sink_module_id": None,
+            "null_sink_module_id": None,
             "active_sinks": None,
             "source_module_id": None,
             "active_sources": None,
@@ -214,70 +333,82 @@ class GraphManager:
             json.dump(self._saved, f)
         self._state_dirty = False
 
-    # ── virtual sink (module-null-sink, server-side) ─────────────────────
+    # ── null-sink lifecycle ──────────────────────────────────────────────
 
-    def _ensure_virtual_sink(self):
-        live_mid = _live_virtual_sink_module_id()
-        if live_mid is None or not _has_virtual_sink():
-            self._saved["virtual_sink_module_id"] = None
-        else:
-            self._saved["virtual_sink_module_id"] = live_mid
+    def _unload_null_sink(self):
+        for mid in _live_null_sink_module_ids():
+            pactl("unload-module", str(mid))
+            log.info("unloaded null-sink id=%d", mid)
+        self._null_sink_module_id = None
+        self._saved["null_sink_module_id"] = None
+        self._mark_dirty()
 
-        if self._saved.get("virtual_sink_module_id") is None:
-            mid = pactl("load-module", "module-null-sink",
-                        f"sink_name={VIRTUAL_SINK_NAME}",
-                        "sink_properties=device.description=AudioMux")
-            if mid.isdigit():
-                self._saved["virtual_sink_module_id"] = int(mid)
-                self._mark_dirty()
-        if _has_virtual_sink():
+    def _ensure_null_sink(self):
+        ids = _live_null_sink_module_ids()
+        if len(ids) > 1:
+            # Collapse duplicates — keep first, unload rest.
+            for mid in ids[1:]:
+                pactl("unload-module", str(mid))
+                log.info("migration: unloaded duplicate null-sink id=%d", mid)
+            ids = ids[:1]
+
+        # Phase-1 leftover: drop any module-combine-sink named audiomux_virtual.
+        for mid in _live_combine_sink_module_ids():
+            pactl("unload-module", str(mid))
+            log.info("migration: unloaded phase-1 combine-sink id=%d", mid)
+
+        if ids and _has_sink(VIRTUAL_SINK_NAME):
+            self._null_sink_module_id = ids[0]
+            self._saved["null_sink_module_id"] = ids[0]
             pactl("set-default-sink", VIRTUAL_SINK_NAME)
+            return
 
-    # ── loopbacks (pw-loopback child processes) ──────────────────────────
+        mid = pactl("load-module", "module-null-sink",
+                    f"sink_name={VIRTUAL_SINK_NAME}",
+                    "sink_properties=device.description=AudioMux")
+        if not mid.isdigit():
+            log.error("failed to load null-sink: %r", mid)
+            return
+        self._null_sink_module_id = int(mid)
+        self._saved["null_sink_module_id"] = int(mid)
+        self._mark_dirty()
+        for _ in range(20):
+            if _has_sink(VIRTUAL_SINK_NAME):
+                break
+            time.sleep(0.05)
+        pactl("set-default-sink", VIRTUAL_SINK_NAME)
+        log.info("loaded null-sink id=%d", self._null_sink_module_id)
 
-    def _loopback_alive(self, sink_name):
-        proc = self._loopback_procs.get(sink_name)
-        return proc is not None and proc.poll() is None
+    # ── loopback lifecycle ───────────────────────────────────────────────
 
     def _compute_delays(self):
-        """Compute per-sink delay so the slowest device gets 0 extra delay
-        and faster devices are delayed to match.
+        """For each active sink, compute the pw-loopback --delay (ms).
 
-        Offset meaning: how much extra hardware latency this device has (ms).
-        Higher offset = slower device.  The device with the highest offset
-        gets --delay 0; others get enough delay to compensate."""
+        Offset semantics (unchanged since 0.2.0):
+          offsets[sink] = this sink's measured hardware delay (ms, >= 0).
+          Slowest sink (max offset) is the baseline → 0 added delay.
+          Faster sinks get `max_offset - offset[sink]` to slow them down.
+        """
         offsets = load_offsets()
-        active = set(self._saved.get("active_sinks") or [])
-        active_offsets = {name: offsets.get(name, 0) for name in active}
-        max_offset = max(active_offsets.values()) if active_offsets else 0
-        return {name: max(0, max_offset - off)
-                for name, off in active_offsets.items()}
+        active = self._saved.get("active_sinks") or []
+        raw = {n: int(offsets.get(n, 0) or 0) for n in active}
+        mx = max(raw.values()) if raw else 0
+        return {n: max(0, mx - v) for n, v in raw.items()}
 
-    def _add_loopback(self, sink_name):
-        if self._loopback_alive(sink_name):
-            return
-        # Kill stale process if it exited
-        self._loopback_procs.pop(sink_name, None)
-
-        delays = self._compute_delays()
-        delay_ms = delays.get(sink_name, 0)
-        delay_s = delay_ms / 1000.0
-
-        # Sanitize sink name for use as a PipeWire node name
-        safe_name = sink_name.replace(".", "_").replace(":", "_")
-
+    def _spawn_loopback(self, sink_name, delay_ms):
+        safe = _safe_name(sink_name)
         cmd = [
             "pw-loopback",
-            "--name", f"audiomux_lb_{safe_name}",
-            "--group", f"audiomux_lb_{safe_name}",
+            "--name", f"{LOOPBACK_NAME_PREFIX}{safe}",
+            "--group", f"{LOOPBACK_NAME_PREFIX}{safe}",
             "--channels", "2",
             "--latency", str(BASE_LATENCY_MS),
             "--capture", VIRTUAL_SINK_NAME,
             "--capture-props", "stream.capture.sink=true",
             "--playback", sink_name,
         ]
-        if delay_s > 0:
-            cmd.extend(["--delay", f"{delay_s:.3f}"])
+        if delay_ms > 0:
+            cmd.extend(["--delay", f"{delay_ms / 1000.0:.3f}"])
 
         proc = subprocess.Popen(
             cmd,
@@ -285,59 +416,73 @@ class GraphManager:
             stderr=subprocess.DEVNULL,
         )
         self._loopback_procs[sink_name] = proc
-        log.info("started pw-loopback for %s (pid %d, delay %dms)",
+        self._loopback_delays[sink_name] = delay_ms
+        log.info("spawned pw-loopback for %s pid=%d delay=%dms",
                  sink_name, proc.pid, delay_ms)
 
-    def _remove_loopback(self, sink_name):
+    def _loopback_alive(self, sink_name):
+        proc = self._loopback_procs.get(sink_name)
+        return proc is not None and proc.poll() is None
+
+    def _kill_loopback(self, sink_name):
         proc = self._loopback_procs.pop(sink_name, None)
-        if proc is not None:
+        self._loopback_delays.pop(sink_name, None)
+        if proc is None:
+            return
+        if proc.poll() is None:
             proc.terminate()
             try:
                 proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
-            log.info("stopped pw-loopback for %s (pid %d)", sink_name, proc.pid)
+        log.info("killed pw-loopback for %s pid=%d", sink_name, proc.pid)
 
-    def _remove_all_loopbacks(self):
-        for sink_name in list(self._loopback_procs):
-            self._remove_loopback(sink_name)
+    def _kill_all_loopbacks(self):
+        for sink in list(self._loopback_procs):
+            self._kill_loopback(sink)
 
-    def _active_loopback_sinks(self):
-        """Return set of sink names with a live pw-loopback process."""
-        return {name for name in self._loopback_procs
-                if self._loopback_alive(name)}
+    def _ensure_loopbacks(self):
+        """Reconcile the set of live loopbacks against active_sinks and the
+        currently-stored delays. Spawn missing, respawn delay-changed, kill
+        sinks that left the active set."""
+        active = set(self._saved.get("active_sinks") or [])
+        delays = self._compute_delays()
 
-    # ── master sink ──────────────────────────────────────────────────────
+        # Kill loopbacks for sinks that dropped out of the active set.
+        for sink in list(self._loopback_procs):
+            if sink not in active:
+                self._kill_loopback(sink)
+
+        # Reap dead procs so _loopback_alive is accurate.
+        for sink in list(self._loopback_procs):
+            if not self._loopback_alive(sink):
+                log.warning("pw-loopback for %s died; will respawn", sink)
+                self._loopback_procs.pop(sink, None)
+                self._loopback_delays.pop(sink, None)
+
+        # Spawn / respawn.
+        for sink in active:
+            desired = delays.get(sink, 0)
+            if not self._loopback_alive(sink):
+                self._spawn_loopback(sink, desired)
+            elif self._loopback_delays.get(sink) != desired:
+                self._kill_loopback(sink)
+                self._spawn_loopback(sink, desired)
+
+    # ── master sink selection ────────────────────────────────────────────
 
     def _resolve_master(self, active_sinks):
-        """Pick the master sink from the active set."""
         if self._master_sink and self._master_sink in active_sinks:
             return self._master_sink
         if PRIMARY_SINK in active_sinks:
             return PRIMARY_SINK
         return next(iter(active_sinks)) if active_sinks else None
 
-    # ── legacy cleanup ───────────────────────────────────────────────────
-
-    def _cleanup_legacy_loopbacks(self):
-        """Remove any old pactl module-loopback instances from before the
-        switch to pw-loopback.  Skip sinks that already have a live
-        pw-loopback process (pw-loopback may register a PulseAudio-visible
-        module internally)."""
-        legacy = _live_pactl_loopback_modules()
-        for sink_name, mid in legacy.items():
-            if self._loopback_alive(sink_name):
-                continue
-            log.info("cleaning up legacy module-loopback for %s (module %d)",
-                     sink_name, mid)
-            pactl("unload-module", mid)
-
     # ── reconciliation ───────────────────────────────────────────────────
 
     def reconcile(self):
-        """Ensure the live graph matches desired state."""
-        if self._reconciling:
+        if self._reconciling or self._calibrating:
             return
         self._reconciling = True
         try:
@@ -360,29 +505,56 @@ class GraphManager:
             if s.name != COMBINE_SOURCE_NAME and "monitor" not in s.name
         }
 
-        # Clean up legacy pactl loopbacks once on startup
-        if not self._legacy_cleaned:
-            self._cleanup_legacy_loopbacks()
-            self._legacy_cleaned = True
+        # Hotplug logging — surface new/removed devices. Useful when
+        # watching BT speakers connect / disconnect during beta testing.
+        if self._known_sinks:
+            new_sinks = sink_names - self._known_sinks
+            gone_sinks = self._known_sinks - sink_names
+            for sn in sorted(new_sinks):
+                log.info("hotplug: new sink appeared: %s", sn)
+            for sn in sorted(gone_sinks):
+                log.info("hotplug: sink disappeared: %s", sn)
+            # Stamp on EITHER side of the transition: WirePlumber pulls
+            # the default away from audiomux_virtual on disconnect too,
+            # and without the stamp the reconcile path would read that
+            # as a user-initiated switch and disengage AudioMux mid-
+            # disconnect/reconnect churn.
+            if new_sinks or gone_sinks:
+                self._last_hotplug_at = time.time()
+        if self._known_sources:
+            for sn in sorted(source_names - self._known_sources):
+                log.info("hotplug: new source appeared: %s", sn)
+            for sn in sorted(self._known_sources - source_names):
+                log.info("hotplug: source disappeared: %s", sn)
+        self._known_sinks = set(sink_names)
+        self._known_sources = set(source_names)
 
-        # If default sink moved away from AudioMux, collapse
-        if server.default_sink_name != VIRTUAL_SINK_NAME:
-            desired = ([server.default_sink_name]
-                       if server.default_sink_name in sink_names else [])
-            self._saved["active_sinks"] = desired
-            self._remove_all_loopbacks()
-            if (self._saved.get("virtual_sink_module_id") is not None
-                    and _has_virtual_sink()):
-                pactl("unload-module", self._saved["virtual_sink_module_id"])
-                self._saved["virtual_sink_module_id"] = None
-            self._mark_dirty()
-            self.flush_state()
-            return
+        # If the system default is a real sink (not audiomux_virtual)
+        # and we aren't in the middle of a hotplug, it's a user-
+        # initiated switch — disengage entirely.
+        _REASSERT_WINDOW_S = 10.0
+        if (server.default_sink_name != VIRTUAL_SINK_NAME
+                and server.default_sink_name in sink_names
+                and _has_sink(VIRTUAL_SINK_NAME)):
+            since_hotplug = time.time() - self._last_hotplug_at
+            if since_hotplug < _REASSERT_WINDOW_S:
+                log.info("reasserting default sink to %s (was %s, "
+                         "%.1fs after hotplug)",
+                         VIRTUAL_SINK_NAME,
+                         server.default_sink_name, since_hotplug)
+                pactl("set-default-sink", VIRTUAL_SINK_NAME)
+            else:
+                log.info("user chose %s as default (%.1fs since last "
+                         "hotplug); disengaging audiomux",
+                         server.default_sink_name, since_hotplug)
+                with self._mutation_lock:
+                    self._kill_all_loopbacks()
+                    self._unload_null_sink()
+                self._saved["active_sinks"] = [server.default_sink_name]
+                self._mark_dirty()
+                self.flush_state()
+                return
 
-        # Ensure virtual sink exists
-        self._ensure_virtual_sink()
-
-        # Reconcile active_sinks list against available sinks
         active = [
             n for n in (self._saved.get("active_sinks") or [])
             if n in sink_names
@@ -392,9 +564,6 @@ class GraphManager:
                 PRIMARY_SINK, sink_names, server.default_sink_name)
             active = [fb] if fb else []
 
-        active_set = set(active)
-
-        # Reconcile active_sources
         active_sources = [
             n for n in (self._saved.get("active_sources") or [])
             if n in source_names
@@ -404,29 +573,39 @@ class GraphManager:
                 PRIMARY_SOURCE, source_names, server.default_source_name)
             active_sources = [fb] if fb else []
 
-        # Kill loopbacks for sinks that are no longer active or available
-        live = self._active_loopback_sinks()
-        for sn in live - active_set:
-            self._remove_loopback(sn)
-
-        # Restart dead loopbacks, add new ones
-        for sn in active_set:
-            if not self._loopback_alive(sn):
-                self._add_loopback(sn)
-
-        self._master_sink = self._resolve_master(active_set)
-
         self._saved["active_sinks"] = active
         self._saved["active_sources"] = active_sources
-        # Remove legacy key if present
-        self._saved.pop("loopback_modules", None)
         self._mark_dirty()
         self.flush_state()
 
-    # ── commands ─────────────────────────────────────────────────────────
+        if len(active) <= 1:
+            # Narrowed to ≤1 sink — disengage. Either the user unchecked
+            # everything but one, or the other sinks disappeared.
+            # Do NOT override the system default: when disengaged we
+            # simply track whatever the user/system has chosen. Pinning
+            # the default from `active[0]` would fight user clicks in
+            # the Plasma widget.
+            with self._mutation_lock:
+                self._kill_all_loopbacks()
+                self._unload_null_sink()
+            if server.default_sink_name in sink_names:
+                # Adopt the live default into our saved state so the
+                # next reconcile doesn't see a stale active_sinks and
+                # behave surprisingly.
+                active = [server.default_sink_name]
+                self._saved["active_sinks"] = active
+                self._mark_dirty()
+                self.flush_state()
+        else:
+            with self._mutation_lock:
+                self._ensure_null_sink()
+                self._ensure_loopbacks()
+
+        self._master_sink = self._resolve_master(set(active))
+
+    # ── state JSON for plasmoid ──────────────────────────────────────────
 
     def get_state_json(self):
-        """Return cached state, refreshing from PipeWire at most every 2s."""
         now = time.time()
         if self._state_cache and now - self._state_cache_time < 2.0:
             return self._state_cache
@@ -435,17 +614,11 @@ class GraphManager:
         return self._state_cache
 
     def invalidate_state_cache(self):
-        """Force next get_state_json to rebuild from PipeWire."""
         self._state_cache = None
 
     def _build_state_json(self):
-        """Query PipeWire and build the JSON state dict."""
         offsets = load_offsets()
-        active_sink_set = self._active_loopback_sinks()
-        # If no loopbacks alive, trust saved state (might be starting up)
-        if not active_sink_set:
-            active_sink_set = set(self._saved.get("active_sinks") or [])
-
+        active_sink_set = set(self._saved.get("active_sinks") or [])
         active_source_set = set(self._saved.get("active_sources") or [])
 
         with pulsectl.Pulse("audiomux-syncd-state") as pulse:
@@ -459,8 +632,6 @@ class GraphManager:
             }
 
             has_virtual = any(s.name == VIRTUAL_SINK_NAME for s in sink_list)
-
-            # If virtual sink is not active, trust system default
             if not has_virtual or server.default_sink_name != VIRTUAL_SINK_NAME:
                 active_sink_set = {server.default_sink_name}
 
@@ -508,6 +679,7 @@ class GraphManager:
             "wireplumber.service", "ActiveEnterTimestamp")
 
         return {
+            "daemon_version": DAEMON_VERSION,
             "sinks": sinks,
             "sources": sources,
             "master_sink": master,
@@ -517,7 +689,9 @@ class GraphManager:
             },
         }
 
-    def _set_active_sinks_inner(self, names, force_rebuild=False):
+    # ── command methods ──────────────────────────────────────────────────
+
+    def set_active_sinks(self, names, pin_default=True):
         with pulsectl.Pulse("audiomux-syncd-set-sinks") as pulse:
             sink_names = {
                 s.name for s in pulse.sink_list()
@@ -530,32 +704,30 @@ class GraphManager:
                     pulse.server_info().default_sink_name)
                 names = [fb] if fb else []
 
-        names_set = set(names)
-        current = self._active_loopback_sinks()
-
-        self._ensure_virtual_sink()
-
-        if force_rebuild:
-            self._remove_all_loopbacks()
-            current = set()
-
-        for sn in current - names_set:
-            self._remove_loopback(sn)
-        for sn in names_set - current:
-            self._add_loopback(sn)
-
-        if force_rebuild:
-            pactl("set-sink-mute", VIRTUAL_SINK_NAME, 0)
-            for sn in names_set:
-                pactl("set-sink-mute", sn, 0)
-
-        self._master_sink = self._resolve_master(names_set)
-        self._saved["active_sinks"] = list(names_set)
+        names = sorted(set(names))
+        self._saved["active_sinks"] = names
         self._mark_dirty()
         self.flush_state()
 
-    def set_active_sinks(self, names):
-        self._set_active_sinks_inner(names)
+        # Engage only when we're actually multiplexing. With ≤1 active
+        # sink there's nothing to mux — pointless to insert null-sink +
+        # loopback into the path, and "AudioMux" shouldn't clutter the
+        # Plasma sink list when it isn't doing anything.
+        if len(names) <= 1:
+            with self._mutation_lock:
+                self._kill_all_loopbacks()
+                self._unload_null_sink()
+            # Only pin the system default when this came from a user
+            # action (applet click, unbond_all). Bootstrap passes
+            # pin_default=False so it doesn't clobber the autoswitch
+            # priority WirePlumber would otherwise pick.
+            if names and pin_default:
+                pactl("set-default-sink", names[0])
+        else:
+            with self._mutation_lock:
+                self._ensure_null_sink()
+                self._ensure_loopbacks()
+        self._master_sink = self._resolve_master(set(names))
 
     def set_active_sources(self, names):
         with pulsectl.Pulse("audiomux-syncd-set-sources") as pulse:
@@ -591,32 +763,26 @@ class GraphManager:
 
     def set_sink_offset(self, name, offset_ms):
         offsets = load_offsets()
-        offsets[name] = max(0, offset_ms)
+        old = int(offsets.get(name, 0) or 0)
+        new = max(0, int(offset_ms))
+        offsets[name] = new
+        if old != new:
+            log.info("manual: offset %s  %d ms → %d ms", name, old, new)
         save_offsets(offsets)
-        # Schedule a debounced rebuild of ALL loopbacks since the relative
-        # delays depend on the max offset across all active sinks.
-        now = time.time()
-        for sn in list(self._loopback_procs):
-            if self._loopback_alive(sn):
-                self._pending_offset_rebuilds[sn] = now
-
-    def flush_pending_offset_rebuilds(self):
-        """Rebuild loopbacks whose offset changed, after a debounce period."""
-        if not self._pending_offset_rebuilds:
-            return
-        now = time.time()
-        ready = [name for name, ts in self._pending_offset_rebuilds.items()
-                 if now - ts >= 0.8]
-        for name in ready:
-            del self._pending_offset_rebuilds[name]
-            if self._loopback_alive(name):
-                log.info("applying offset change for %s", name)
-                self._remove_loopback(name)
-                self._add_loopback(name)
+        # Delay changes are relative — any one offset change can shift
+        # every sink's --delay, so let _ensure_loopbacks sort out which
+        # procs actually need respawning (it compares against the last
+        # known delay per sink). Skip entirely when disengaged: with ≤1
+        # active sink, audiomux_virtual has been unloaded, and spawning
+        # a pw-loopback against a missing capture sink would just fail.
+        active = self._saved.get("active_sinks") or []
+        if len(active) > 1:
+            with self._mutation_lock:
+                self._ensure_loopbacks()
 
     def set_source_offset(self, name, offset_ms):
         offsets = load_offsets()
-        offsets[name] = offset_ms
+        offsets[name] = int(offset_ms)
         save_offsets(offsets)
 
     def set_master_sink(self, name):
@@ -631,140 +797,270 @@ class GraphManager:
         self.set_active_sinks([PRIMARY_SINK])
         self.set_active_sources([PRIMARY_SOURCE])
 
+    def active_sinks(self):
+        return list(self._saved.get("active_sinks") or [])
+
+    def owned_loopback_pids(self):
+        return [p.pid for p in self._loopback_procs.values() if p.poll() is None]
+
+    # ── calibration helpers ──────────────────────────────────────────────
+
+    def prepare_for_calibration(self, sinks):
+        """Tear down all loopbacks so the calibrator can play directly to
+        hardware sinks with no interference. Also zero any stale
+        latencyOffsetNsec (leftover from the short-lived Phase-1 attempt)
+        on each hardware sink."""
+        with self._mutation_lock:
+            self._kill_all_loopbacks()
+        dump = _pw_dump()
+        for sn in sinks:
+            node_id = _find_sink_node_id(sn, dump)
+            _pw_clear_latency_offset(node_id)
+
+    def restore_after_calibration(self, sinks):
+        """Re-spawn loopbacks with whatever offsets are now in the file.
+
+        Filter to sinks still present in the live graph — reconcile is
+        gated off while calibration is running, so a BT disconnect
+        during the window would otherwise leave audiomux_virtual
+        re-engaged with a stale active_sinks entry until the next
+        reconcile catches up.
+        """
+        with pulsectl.Pulse("audiomux-syncd-restore-cal") as pulse:
+            live_sinks = {
+                s.name for s in pulse.sink_list()
+                if s.name != VIRTUAL_SINK_NAME and "monitor" not in s.name
+            }
+        sinks = [s for s in sinks if s in live_sinks]
+        self._saved["active_sinks"] = list(sinks)
+        self._mark_dirty()
+        self.flush_state()
+        # Refresh master immediately: if the prior master disappeared
+        # during the calibration window, DriftMonitor would otherwise
+        # keep using it as the reference until the next reconcile
+        # (up to RECONCILE_INTERVAL), misclassifying healthy followers
+        # as degraded and risking spurious loopback restarts.
+        self._master_sink = self._resolve_master(set(sinks))
+        if len(sinks) <= 1:
+            # Disengage: nothing left to multiplex.
+            with self._mutation_lock:
+                self._kill_all_loopbacks()
+                self._unload_null_sink()
+            return
+        with self._mutation_lock:
+            self._ensure_null_sink()
+            self._ensure_loopbacks()
+
+    # ── shutdown ─────────────────────────────────────────────────────────
+
     def shutdown(self):
-        """Clean up all loopback processes."""
-        log.info("terminating %d loopback processes", len(self._loopback_procs))
-        self._remove_all_loopbacks()
+        log.info("shutting down — killing %d loopbacks",
+                 len(self._loopback_procs))
+        with self._mutation_lock:
+            self._kill_all_loopbacks()
+            # Unload audiomux_virtual too, otherwise it stays around as
+            # the default sink with nothing forwarding it to hardware
+            # and any new audio routes into a black hole.
+            self._unload_null_sink()
 
 
-# ── SyncMeasurer ─────────────────────────────────────────────────────────────
+# ── DriftMonitor ─────────────────────────────────────────────────────────────
 
-class SyncMeasurer:
-    """Periodically measures sync offset between master and follower sinks.
+class DriftMonitor:
+    """Passive drift telemetry from `pw-dump` snapshots (unchanged from
+    Phase 3). Samples each active follower sink's `Params.Latency.Input.minNs`
+    at `MEASURE_INTERVAL` cadence and surfaces offset/drift/jitter in the
+    state JSON."""
 
-    Runs cross-correlation of monitor stream captures every MEASURE_INTERVAL
-    seconds.  Maintains a rolling window of measurements per follower sink
-    and computes offset, drift rate, jitter, and confidence.  Triggers
-    loopback rebuild if a follower drifts beyond the allowed threshold.
-    """
+    RESYNC_COOLDOWN_S = 2.0
+
+    # Every N samples, dump a summary of each follower's current state at
+    # INFO so beta testers can see drift without toggling debug logs.
+    SUMMARY_EVERY_N_SAMPLES = 10
 
     def __init__(self, graph):
         self._graph = graph
-        # {sink_name: deque of (timestamp, offset_ms, confidence)}
         self._history = collections.defaultdict(
             lambda: collections.deque(maxlen=MEASURE_WINDOW))
-        # {sink_name: consecutive count of exceeded measurements}
         self._exceed_count = collections.defaultdict(int)
-        self._last_offset = {}  # {sink_name: last measured offset_ms}
-        self.enabled = False  # disabled by default; parecord polling causes mic clicking
+        self._last_resync_ts = 0.0
+        self._lock = threading.Lock()
+        self._sample_count = 0
+        self._last_reported_latency = {}  # {sink: ns} — for per-sample change logs
+        self.enabled = True
 
     async def run(self):
         while True:
             await asyncio.sleep(MEASURE_INTERVAL)
-            if not self.enabled:
+            if not self.enabled or self._graph._calibrating:
                 continue
             try:
-                await self._measure_all()
+                self._sample()
+                self._maybe_resync()
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("sync measurement failed")
+                log.exception("drift sampling failed")
 
-    async def _measure_all(self):
+    def _sample(self):
+        dump = _pw_dump()
+        active = set(self._graph.active_sinks())
+        now = time.time()
+        sampled = {}
+        with self._lock:
+            for obj in dump:
+                if obj.get("type") != "PipeWire:Interface:Node":
+                    continue
+                info = obj.get("info") or {}
+                props = info.get("props") or {}
+                name = props.get("node.name", "")
+                if name not in active:
+                    continue
+                params = info.get("params") or {}
+                latency = params.get("Latency", []) or []
+                input_ns = None
+                for lat in latency:
+                    if (isinstance(lat, dict)
+                            and lat.get("direction") == "Input"):
+                        input_ns = lat.get("minNs")
+                        break
+                if input_ns is None:
+                    continue
+                self._history[name].append((now, int(input_ns)))
+                sampled[name] = int(input_ns)
+            for n in list(self._history):
+                if n not in active:
+                    self._history.pop(n, None)
+                    self._exceed_count.pop(n, None)
+
+            # Surface per-sink Params.Latency whenever it changes materially.
+            # BT codec buffers are the most interesting case — they jump
+            # around when the remote device wakes / reconnects.
+            for name, ns in sampled.items():
+                prev = self._last_reported_latency.get(name)
+                if prev is None or abs(prev - ns) >= 1_000_000:  # >= 1 ms shift
+                    log.info("drift: %s Params.Latency.Input = %.1f ms "
+                             "(prev %s)", name, ns / 1_000_000.0,
+                             f"{prev/1e6:.1f}ms" if prev is not None else "—")
+                    self._last_reported_latency[name] = ns
+
+            self._sample_count += 1
+            if (self.SUMMARY_EVERY_N_SAMPLES > 0
+                    and self._sample_count % self.SUMMARY_EVERY_N_SAMPLES == 0):
+                master = self._graph._master_sink
+                parts = []
+                for s in sorted(sampled):
+                    role = "M" if s == master else "F"
+                    info = self._compute_locked(s, master)
+                    if info is None:
+                        parts.append(f"{s}[{role}]=…")
+                    else:
+                        parts.append(f"{s}[{role}] lat={info['latency_ms']:.0f}ms "
+                                     f"off={info['offset_ms']:+.0f} "
+                                     f"drift={info['drift_ms_per_min']:+.1f}/min "
+                                     f"jit={info['jitter_ms']:.1f}")
+                if parts:
+                    log.info("drift summary: %s", " | ".join(parts))
+
+    def _maybe_resync(self):
+        active = set(self._graph.active_sinks())
         master = self._graph._master_sink
-        active = self._graph._active_loopback_sinks()
-
-        if not master or master not in active or len(active) < 2:
+        now = time.time()
+        if now - self._last_resync_ts < self.RESYNC_COOLDOWN_S:
             return
-
-        followers = active - {master}
-
-        for follower in followers:
+        triggered = False
+        with self._lock:
+            for sink in active:
+                if sink == master:
+                    continue
+                info = self._compute_locked(sink, master)
+                if info is None:
+                    continue
+                if abs(info["offset_ms"]) >= DRIFT_RECOVER_MS:
+                    self._exceed_count[sink] += 1
+                    if self._exceed_count[sink] >= DRIFT_RECOVER_COUNT:
+                        triggered = True
+                        self._exceed_count[sink] = 0
+                else:
+                    self._exceed_count[sink] = 0
+        if triggered:
+            log.warning("drift monitor: hard resync (sustained offset ≥ "
+                        "%dms on a follower)", DRIFT_RECOVER_MS)
+            self._last_resync_ts = now
             try:
-                offset_ms, confidence = await asyncio.get_event_loop().run_in_executor(
-                    None, self._measure_pair, master, follower)
+                with self._graph._mutation_lock:
+                    # Force a real restart: _ensure_loopbacks alone only
+                    # respawns when the proc died or the configured delay
+                    # changed, neither of which is true when drift just
+                    # accumulates inside a live loopback.
+                    self._graph._kill_all_loopbacks()
+                    self._graph._ensure_loopbacks()
+                # Wipe history so the next _compute_locked window starts
+                # fresh against the new loopbacks. Without this, the old
+                # post-drift samples keep the rolling median biased for
+                # ~half a window and _maybe_resync retriggers every few
+                # samples — flapping loopbacks audibly.
+                with self._lock:
+                    self._history.clear()
+                    self._exceed_count.clear()
             except Exception:
-                log.exception("measurement failed for %s vs %s",
-                              master, follower)
-                continue
+                log.exception("resync attempt failed")
 
-            now = time.time()
+    def _compute_locked(self, sink_name, master):
+        hist = self._history.get(sink_name)
+        if not hist or len(hist) < 2:
+            return None
+        ts_list = [t for t, _ in hist]
+        lat_ms = [ns / 1_000_000.0 for _, ns in hist]
+        sorted_ms = sorted(lat_ms)
+        median = sorted_ms[len(sorted_ms) // 2]
+        current = lat_ms[-1]
+        follower_dev = current - median
 
-            if confidence < 0.1:
-                # Too quiet to measure — record as silent
-                self._history[follower].append((now, None, 0.0))
-                self._exceed_count[follower] = 0
-                continue
+        # When the master sink is also being monitored, drift only
+        # matters relative to it: a system-wide latency wobble that
+        # moves master and follower together isn't a sync problem,
+        # but the follower diverging from master is. Subtract the
+        # master's same-window deviation when available; fall back
+        # to the follower-only signal otherwise.
+        master_dev = 0.0
+        if master and master != sink_name:
+            m_hist = self._history.get(master)
+            if m_hist and len(m_hist) >= 2:
+                m_lat = [ns / 1_000_000.0 for _, ns in m_hist]
+                m_sorted = sorted(m_lat)
+                master_dev = m_lat[-1] - m_sorted[len(m_sorted) // 2]
+        offset_ms = follower_dev - master_dev
 
-            # Check for sudden jump (BT rebuffer, HDMI resync, etc.)
-            prev_offset = self._last_offset.get(follower)
-            self._last_offset[follower] = offset_ms
+        jitter_ms = 0.0
+        if len(lat_ms) > 1:
+            mean = sum(lat_ms) / len(lat_ms)
+            jitter_ms = (sum((y - mean) ** 2 for y in lat_ms)
+                         / len(lat_ms)) ** 0.5
 
-            self._history[follower].append((now, offset_ms, confidence))
+        drift_ms_per_min = 0.0
+        if len(hist) >= 3:
+            t0 = ts_list[0]
+            xs = [t - t0 for t in ts_list]
+            ys = lat_ms
+            n = len(xs)
+            sx, sy = sum(xs), sum(ys)
+            sxy = sum(x * y for x, y in zip(xs, ys))
+            sxx = sum(x * x for x in xs)
+            denom = n * sxx - sx * sx
+            if denom > 0:
+                slope = (n * sxy - sx * sy) / denom
+                drift_ms_per_min = slope * 60.0
 
-            if (prev_offset is not None
-                    and confidence > 0.5
-                    and abs(offset_ms - prev_offset) > JUMP_THRESHOLD_MS):
-                log.warning(
-                    "follower %s jumped %.1fms → %.1fms (delta %.1fms) "
-                    "— immediate rebuild",
-                    follower, prev_offset, offset_ms,
-                    offset_ms - prev_offset)
-                self._graph._remove_loopback(follower)
-                self._graph._add_loopback(follower)
-                self._exceed_count[follower] = 0
-                self._last_offset[follower] = None
-                continue
-
-            # Sustained drift recovery
-            if abs(offset_ms) > DRIFT_RECOVER_MS:
-                self._exceed_count[follower] += 1
-                if self._exceed_count[follower] >= DRIFT_RECOVER_COUNT:
-                    log.warning(
-                        "follower %s offset %.1fms exceeds threshold "
-                        "for %d consecutive measurements — rebuilding",
-                        follower, offset_ms, DRIFT_RECOVER_COUNT)
-                    self._graph._remove_loopback(follower)
-                    self._graph._add_loopback(follower)
-                    self._exceed_count[follower] = 0
-                    self._last_offset[follower] = None
-            else:
-                self._exceed_count[follower] = 0
-
-    @staticmethod
-    def _measure_pair(master_sink, follower_sink):
-        """Record from both monitors, cross-correlate.  Runs in a thread."""
-        master_buf = []
-        follower_buf = []
-        errors = []
-
-        def rec(sink, buf):
-            try:
-                buf.extend(record_monitor(sink, MEASURE_DURATION))
-            except Exception as e:
-                errors.append(str(e))
-
-        t1 = threading.Thread(target=rec, args=(master_sink, master_buf))
-        t2 = threading.Thread(target=rec, args=(follower_sink, follower_buf))
-        t1.start()
-        t2.start()
-        t1.join(timeout=5)
-        t2.join(timeout=5)
-
-        if errors:
-            raise RuntimeError("; ".join(errors))
-
-        if is_silence(master_buf) or is_silence(follower_buf):
-            return 0.0, 0.0  # silent — can't measure
-
-        ds_master = downsample(master_buf)
-        ds_follower = downsample(follower_buf)
-
-        lag_samples, corr = xcorr_offset(ds_master, ds_follower)
-        return lag_to_ms(lag_samples), corr
+        return {
+            "offset_ms": offset_ms,
+            "drift_ms_per_min": drift_ms_per_min,
+            "jitter_ms": jitter_ms,
+            "latency_ms": current,
+            "samples": len(hist),
+        }
 
     def get_sync_info(self, sink_name):
-        """Return sync telemetry dict for a given sink."""
         master = self._graph._master_sink
         if sink_name == master:
             return {
@@ -775,81 +1071,44 @@ class SyncMeasurer:
                 "confidence": 1.0,
                 "status": "reference",
             }
-
-        history = self._history.get(sink_name)
-        if not history or len(history) == 0:
+        with self._lock:
+            info = self._compute_locked(sink_name, master)
+            exceed = self._exceed_count.get(sink_name, 0)
+        if info is None:
             return {
                 "role": "follower",
                 "offset_ms": 0,
                 "drift_ms_per_min": 0,
                 "jitter_ms": 0,
-                "confidence": 0,
+                "confidence": 0.0,
                 "status": "measuring",
             }
-
-        # Filter to measurements with actual data (not silent)
-        valid = [(ts, off, conf) for ts, off, conf in history
-                 if off is not None and conf > 0.1]
-
-        if not valid:
-            return {
-                "role": "follower",
-                "offset_ms": 0,
-                "drift_ms_per_min": 0,
-                "jitter_ms": 0,
-                "confidence": 0,
-                "status": "silent",
-            }
-
-        offsets = [off for _, off, _ in valid]
-        confidences = [conf for _, _, conf in valid]
-
-        current_offset = offsets[-1]
-        mean_confidence = sum(confidences) / len(confidences)
-        jitter = (math.sqrt(sum((o - sum(offsets) / len(offsets)) ** 2
-                                for o in offsets) / len(offsets))
-                  if len(offsets) > 1 else 0)
-
-        # Drift rate via simple linear regression over timestamps
-        drift = 0.0
-        if len(valid) >= 3:
-            ts_list = [ts for ts, _, _ in valid]
-            t0 = ts_list[0]
-            xs = [t - t0 for t in ts_list]
-            ys = offsets
-            n = len(xs)
-            sum_x = sum(xs)
-            sum_y = sum(ys)
-            sum_xy = sum(x * y for x, y in zip(xs, ys))
-            sum_x2 = sum(x * x for x in xs)
-            denom = n * sum_x2 - sum_x * sum_x
-            if denom != 0:
-                slope = (n * sum_xy - sum_x * sum_y) / denom
-                drift = slope * 60  # ms per minute
-
-        if abs(current_offset) > DRIFT_RECOVER_MS:
-            status = "degraded"
-        elif mean_confidence < 0.5:
+        offset = info["offset_ms"]
+        if abs(offset) >= DRIFT_RECOVER_MS:
+            status = "resyncing" if exceed >= DRIFT_RECOVER_COUNT - 1 else "degraded"
+        elif abs(offset) >= 5:
             status = "degraded"
         else:
             status = "synced"
-
         return {
             "role": "follower",
-            "offset_ms": round(current_offset, 1),
-            "drift_ms_per_min": round(drift, 2),
-            "jitter_ms": round(jitter, 1),
-            "confidence": round(mean_confidence, 2),
+            "offset_ms": round(offset, 1),
+            "drift_ms_per_min": round(info["drift_ms_per_min"], 2),
+            "jitter_ms": round(info["jitter_ms"], 2),
+            "latency_ms": round(info["latency_ms"], 1),
+            "confidence": 1.0,
             "status": status,
+            "samples": info["samples"],
         }
+
+
+SyncMeasurer = DriftMonitor
 
 
 # ── PipeWireMonitor ──────────────────────────────────────────────────────────
 
 class PipeWireMonitor:
-    """Watch PipeWire graph changes via pw-dump --monitor."""
-
-    DEBOUNCE_SEC = 2.0  # min seconds between reconcile triggers
+    DEBOUNCE_SEC = 2.0
 
     def __init__(self, on_change):
         self._on_change = on_change
@@ -874,14 +1133,10 @@ class PipeWireMonitor:
         )
         bracket_depth = 0
         in_array = False
-
         while True:
             chunk = await self._proc.stdout.read(4096)
             if not chunk:
                 break
-
-            # pw-dump --monitor emits top-level JSON arrays.
-            # Track bracket depth to find complete arrays.
             for byte in chunk:
                 ch = chr(byte)
                 if ch == "[":
@@ -901,7 +1156,6 @@ class PipeWireMonitor:
                         except Exception:
                             log.exception(
                                 "reconcile failed after pw-dump event")
-
         rc = await self._proc.wait()
         if rc != 0:
             log.warning("pw-dump exited with code %d", rc)
@@ -915,12 +1169,10 @@ class PipeWireMonitor:
 # ── StateWriter ──────────────────────────────────────────────────────────────
 
 class StateWriter:
-    """Debounced writer: publishes plasmoid-readable JSON at most 2Hz."""
-
     def __init__(self, graph):
         self._graph = graph
         self._pending = False
-        self._min_interval = 0.5  # 2 Hz
+        self._min_interval = 0.5
 
     async def run(self):
         while True:
@@ -943,17 +1195,27 @@ class StateWriter:
 # ── SocketServer ─────────────────────────────────────────────────────────────
 
 class SocketServer:
-    """Unix domain socket server for CLI commands."""
-
     def __init__(self, graph, state_writer, measurer=None):
         self._graph = graph
         self._state_writer = state_writer
         self._measurer = measurer
         self._server = None
         self._calibration_in_progress = False
+        # Socket requests dispatch on executor threads, so two
+        # `check-sync` calls can land in _run_calibration concurrently
+        # — racing prepare/restore against the same graph and mic.
+        # A non-reentrant lock with try_acquire is the gate; the
+        # status flag stays as a publish-side hint.
+        self._calibration_lock = threading.Lock()
 
     async def start(self):
-        self._cleanup_stale_socket()
+        # _probe_single_instance in _main is the sole arbiter of whether
+        # SOCKET_PATH is safe to use; it either confirms no peer is alive
+        # and unlinks any stale file, or it sys.exits. Don't unlink here:
+        # a blind unlink would reopen a TOCTOU window where a concurrent
+        # daemon could rip out our live socket. If something other than
+        # the probe left a file in place, start_unix_server's EADDRINUSE
+        # is the correct failure mode.
         self._server = await asyncio.start_unix_server(
             self._handle_client, path=SOCKET_PATH)
         os.chmod(SOCKET_PATH, 0o600)
@@ -968,30 +1230,12 @@ class SocketServer:
         except FileNotFoundError:
             pass
 
-    def _cleanup_stale_socket(self):
-        if not os.path.exists(SOCKET_PATH):
-            return
-        import socket
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            sock.connect(SOCKET_PATH)
-            log.error("another audiomux-syncd is already running")
-            sys.exit(1)
-        except ConnectionRefusedError:
-            log.info("removing stale socket %s", SOCKET_PATH)
-            os.unlink(SOCKET_PATH)
-        except FileNotFoundError:
-            pass
-        finally:
-            sock.close()
-
     async def _handle_client(self, reader, writer):
         try:
             line = await asyncio.wait_for(reader.readline(), timeout=30.0)
             if not line:
                 return
             request = json.loads(line.decode())
-            # Run dispatch in executor for long-running commands (calibration)
             response = await asyncio.get_event_loop().run_in_executor(
                 None, self._dispatch, request)
             writer.write(json.dumps(response).encode() + b"\n")
@@ -999,7 +1243,7 @@ class SocketServer:
         except asyncio.TimeoutError:
             log.warning("client timed out")
         except (ConnectionResetError, BrokenPipeError):
-            pass  # client disconnected
+            pass
         except Exception:
             log.exception("error handling client")
             try:
@@ -1019,8 +1263,7 @@ class SocketServer:
         cmd = req.get("cmd", "")
         try:
             if cmd == "get-state":
-                state = self._graph.get_state_json()
-                return {"ok": True, "state": state}
+                return {"ok": True, "state": self._graph.get_state_json()}
 
             elif cmd == "set-active-sinks":
                 self._graph.set_active_sinks(req.get("names", []))
@@ -1075,168 +1318,7 @@ class SocketServer:
                 return {"ok": True}
 
             elif cmd == "check-sync":
-                # Acoustic calibration runs in a SUBPROCESS so the
-                # daemon never holds the mic.  If the subprocess hangs,
-                # kill -9 releases everything.
-                self._calibration_in_progress = True
-                active = self._graph._active_loopback_sinks()
-                try:
-                    if len(active) < 2:
-                        return {"ok": False,
-                                "error": "need 2+ active outputs to calibrate"}
-                    with pulsectl.Pulse("audiomux-calibrate") as pulse:
-                        mic = pulse.server_info().default_source_name
-                    if not mic or "monitor" in mic:
-                        return {"ok": False, "error": "no microphone found"}
-
-                    sinks = sorted(active)
-                    log.info("calibration: starting subprocess (mic=%s, "
-                             "sinks=%s)", mic, sinks)
-
-                    # Mute loopbacks during calibration
-                    for sn in list(active):
-                        self._graph._remove_loopback(sn)
-
-                    # Build tone specs: 8 tones in a rising diatonic scale,
-                    # alternating between speakers.  Each speaker gets 4 tones.
-                    n_tones = min(8, len(CALIBRATE_FREQS))
-                    round_specs = []
-                    for i in range(n_tones):
-                        sink = sinks[i % len(sinks)]
-                        freq = CALIBRATE_FREQS[i]
-                        round_specs.append({"sink": sink, "freq": freq})
-
-                    # Run calibration in isolated subprocess
-                    cal_script = os.path.join(
-                        os.path.dirname(os.path.abspath(__file__)),
-                        "audiomux_calibrate.py")
-                    cal_cmd = [sys.executable, cal_script, mic] + sinks
-                    cal_error = None
-                    cal_result = None
-                    try:
-                        proc = subprocess.Popen(
-                            cal_cmd,
-                            stdin=subprocess.PIPE,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                        )
-                        stdout, stderr = proc.communicate(
-                            input=json.dumps(round_specs).encode(),
-                            timeout=45,
-                        )
-                        if proc.returncode != 0:
-                            cal_error = f"subprocess exited {proc.returncode}"
-                            if stderr:
-                                cal_error += f": {stderr.decode()[:200]}"
-                        else:
-                            cal_result = json.loads(stdout.decode())
-                            if not cal_result.get("ok"):
-                                cal_error = cal_result.get("error", "unknown")
-                    except subprocess.TimeoutExpired:
-                        log.warning("calibration subprocess timed out, killing")
-                        proc.kill()
-                        proc.wait()
-                        cal_error = "calibration timed out (mic released)"
-                    except Exception as e:
-                        cal_error = str(e)
-                        log.exception("calibration subprocess failed")
-
-                    # ALWAYS restore loopbacks
-                    log.info("calibration: restoring loopbacks")
-                    for sn in sinks:
-                        self._graph._add_loopback(sn)
-
-                    if cal_error:
-                        self._graph.invalidate_state_cache()
-                        self._state_writer.notify()
-                        return {"ok": False, "error": cal_error}
-
-                    # Process results from subprocess
-                    all_measurements = {sn: [] for sn in sinks}
-                    for rn, results_round in enumerate(
-                            cal_result.get("rounds", [])):
-                        if "error" in results_round:
-                            log.warning("calibration: round %d error: %s",
-                                        rn + 1, results_round["error"])
-                            continue
-                        for sn, data in results_round.items():
-                            delay = data.get("delay_ms", 0)
-                            conf = data.get("confidence", 0)
-                            all_measurements[sn].append((delay, conf))
-                            log.info("calibration: round %d %s = "
-                                     "%.1fms (conf %.2f, %.0fHz)",
-                                     rn + 1, sn, delay, conf,
-                                     data.get("freq", 0))
-
-                    # Average good measurements per sink
-                    results = {}
-                    for sn in sinks:
-                        good = [(d, c) for d, c in all_measurements[sn]
-                                if c > 0.1 and d >= 0]
-                        if good:
-                            avg_delay = sum(d for d, _ in good) / len(good)
-                            avg_conf = sum(c for _, c in good) / len(good)
-                            results[sn] = {
-                                "delay_ms": round(avg_delay, 1),
-                                "confidence": round(avg_conf, 2),
-                                "rounds": len(good),
-                            }
-                        else:
-                            results[sn] = {
-                                "delay_ms": 0, "confidence": 0,
-                                "rounds": 0, "error": "no signal detected",
-                            }
-
-                    # Apply offsets (normalized: fastest = 0)
-                    good_results = {k: v for k, v in results.items()
-                                    if "error" not in v}
-                    if good_results:
-                        if BT_COMPENSATION_MS:
-                            log.info(
-                                "calibration: applying %dms Bluetooth compensation",
-                                BT_COMPENSATION_MS,
-                            )
-                        else:
-                            log.info(
-                                "calibration: Bluetooth compensation disabled; "
-                                "set AUDIOMUX_BT_COMPENSATION_MS to enable it"
-                            )
-                        for sn in good_results:
-                            if "bluez" in sn:
-                                good_results[sn] = dict(good_results[sn])
-                                good_results[sn]["delay_ms"] += BT_COMPENSATION_MS
-                                if BT_COMPENSATION_MS:
-                                    log.info(
-                                        "calibration: added %dms BT compensation to %s",
-                                        BT_COMPENSATION_MS,
-                                        sn,
-                                    )
-
-                        min_delay = min(v["delay_ms"]
-                                        for v in good_results.values())
-                        offsets = load_offsets()
-                        for sn, data in good_results.items():
-                            offsets[sn] = max(0, round(
-                                data["delay_ms"] - min_delay))
-                        save_offsets(offsets)
-                        log.info("calibration: normalized "
-                                 "(min=%.1fms subtracted)", min_delay)
-                        # Rebuild with new delays
-                        for sn in list(
-                                self._graph._active_loopback_sinks()):
-                            self._graph._remove_loopback(sn)
-                        for sn in sinks:
-                            self._graph._add_loopback(sn)
-                        applied = {k: offsets.get(k, 0) for k in sinks}
-                        log.info("calibration: offsets applied %s", applied)
-                    else:
-                        log.warning("calibration: no usable readings")
-
-                    self._graph.invalidate_state_cache()
-                    self._state_writer.notify()
-                    return {"ok": True, "mic": mic, "results": results}
-                finally:
-                    self._calibration_in_progress = False
+                return self._run_calibration()
 
             elif cmd == "ping":
                 return {
@@ -1252,6 +1334,192 @@ class SocketServer:
             log.exception("command %s failed", cmd)
             return {"ok": False, "error": str(e)}
 
+    def _run_calibration(self):
+        """Run the Phase-2 GCC-PHAT calibrator as an isolated subprocess."""
+        lock_held = self._calibration_lock.acquire(blocking=False)
+        if not lock_held:
+            return {"ok": False, "error": "calibration already in progress"}
+        self._calibration_in_progress = True
+        self._graph._calibrating = True
+        sinks = None
+        restored = False
+        try:
+            active = list(self._graph.active_sinks())
+            if len(active) < 2:
+                return {"ok": False,
+                        "error": "need 2+ active outputs to calibrate"}
+
+            with pulsectl.Pulse("audiomux-calibrate") as pulse:
+                mic = pulse.server_info().default_source_name
+            # COMBINE_SOURCE_NAME is the synthetic mixed input we
+            # create when multiple sources are active. It's the
+            # default source in that case, so the prior monitor-only
+            # filter let it through; calibrating against it would
+            # measure a synthetic blend instead of a real mic.
+            if not mic or "monitor" in mic or mic == COMBINE_SOURCE_NAME:
+                return {"ok": False, "error": "no microphone found"}
+
+            sinks = sorted(active)
+            log.info("calibration: starting subprocess (mic=%s, sinks=%s)",
+                     mic, sinks)
+
+            # Tear down loopbacks so the calibrator plays straight to each
+            # hardware sink without our own compensation bias.
+            self._graph.prepare_for_calibration(sinks)
+
+            n_tones = min(8, len(CALIBRATE_FREQS))
+            round_specs = [
+                {"sink": sinks[i % len(sinks)], "freq": CALIBRATE_FREQS[i]}
+                for i in range(n_tones)
+            ]
+
+            cal_script = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "audiomux_calibrate.py")
+            cal_cmd = [sys.executable, cal_script, mic] + sinks
+            cal_error = None
+            cal_result = None
+            try:
+                proc = subprocess.Popen(
+                    cal_cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                stdout, stderr = proc.communicate(
+                    input=json.dumps(round_specs).encode(),
+                    timeout=45,
+                )
+                if proc.returncode != 0:
+                    cal_error = f"subprocess exited {proc.returncode}"
+                    if stderr:
+                        cal_error += f": {stderr.decode()[:200]}"
+                else:
+                    cal_result = json.loads(stdout.decode())
+                    if not cal_result.get("ok"):
+                        cal_error = cal_result.get("error", "unknown")
+            except subprocess.TimeoutExpired:
+                log.warning("calibration subprocess timed out, killing")
+                proc.kill()
+                proc.wait()
+                cal_error = "calibration timed out (mic released)"
+            except Exception as e:
+                cal_error = str(e)
+                log.exception("calibration subprocess failed")
+
+            if cal_error:
+                log.info("calibration: restoring graph after error")
+                self._graph.restore_after_calibration(sinks)
+                restored = True
+                self._graph.invalidate_state_cache()
+                self._state_writer.notify()
+                return {"ok": False, "error": cal_error}
+
+            all_measurements = {sn: [] for sn in sinks}
+            for rn, results_round in enumerate(
+                    cal_result.get("rounds", [])):
+                if "error" in results_round:
+                    log.warning("calibration: round %d error: %s",
+                                rn + 1, results_round["error"])
+                    continue
+                for sn, data in results_round.items():
+                    delay = data.get("delay_ms", 0)
+                    conf = data.get("confidence", 0)
+                    all_measurements[sn].append((delay, conf))
+                    pr = data.get("peak_ratio")
+                    log.info("calibration: round %d %s = %.1fms "
+                             "(conf %.2f, peak_ratio=%s)",
+                             rn + 1, sn, delay, conf,
+                             f"{pr:.1f}" if pr is not None else "—")
+
+            results = {}
+            for sn in sinks:
+                good = [(d, c) for d, c in all_measurements[sn]
+                        if c > 0.1 and d >= 0]
+                if good:
+                    avg_delay = sum(d for d, _ in good) / len(good)
+                    avg_conf = sum(c for _, c in good) / len(good)
+                    results[sn] = {
+                        "delay_ms": round(avg_delay, 1),
+                        "confidence": round(avg_conf, 2),
+                        "rounds": len(good),
+                    }
+                else:
+                    results[sn] = {
+                        "delay_ms": 0, "confidence": 0,
+                        "rounds": 0, "error": "no signal detected",
+                    }
+
+            good_results = {k: v for k, v in results.items()
+                            if "error" not in v}
+            failed = [k for k, v in results.items() if "error" in v]
+            offsets_applied = False
+            if good_results and not failed:
+                # All-or-nothing: blending fresh offsets for measured
+                # sinks with stale ones for failed sinks would skew
+                # the whole group since min_delay normalizes only the
+                # fresh set. Save offsets only when every sink in this
+                # run produced a usable reading; otherwise leave the
+                # file untouched and ask the user to retry.
+                min_delay = min(v["delay_ms"]
+                                for v in good_results.values())
+                offsets = load_offsets()
+                for sn, data in good_results.items():
+                    offsets[sn] = max(0, round(
+                        data["delay_ms"] - min_delay))
+                save_offsets(offsets)
+                offsets_applied = True
+                log.info("calibration: normalized (min=%.1fms subtracted)",
+                         min_delay)
+                applied = {k: offsets.get(k, 0) for k in sinks}
+                log.info("calibration: offsets applied %s", applied)
+            elif good_results:
+                log.warning("calibration: partial measurement "
+                            "(%d/%d sinks failed: %s); offsets unchanged — "
+                            "re-run when the failing sinks stabilize",
+                            len(failed), len(results), failed)
+            else:
+                log.warning("calibration: no usable readings")
+
+            self._graph.restore_after_calibration(sinks)
+            restored = True
+            self._graph.invalidate_state_cache()
+            self._state_writer.notify()
+            # When offsets weren't written (no good readings, or partial
+            # failure under the all-or-nothing rule), surface that via
+            # ok=false. The plasmoid's success path treats per-sink
+            # non-error entries as applied, so a silent ok=true here
+            # would leave the user thinking calibration succeeded while
+            # the offsets are actually stale.
+            if not offsets_applied:
+                if failed and good_results:
+                    err = (f"partial measurement ({len(failed)}/"
+                           f"{len(results)} sinks failed: "
+                           f"{', '.join(failed)}); offsets unchanged — "
+                           "re-run when the failing sinks stabilize")
+                else:
+                    err = "no usable readings; offsets unchanged"
+                return {"ok": False, "mic": mic,
+                        "results": results, "error": err}
+            return {"ok": True, "mic": mic, "results": results}
+        finally:
+            self._calibration_in_progress = False
+            self._graph._calibrating = False
+            # If we tore down loopbacks for calibration and an
+            # unexpected exception unwound past both restore points
+            # (result-processing crash, save_offsets failure, etc.),
+            # the graph would be stuck torn down with audiomux_virtual
+            # still loaded and nothing forwarding audio. Guarantee
+            # restoration here.
+            if not restored and sinks:
+                try:
+                    self._graph.restore_after_calibration(sinks)
+                except Exception:
+                    log.exception(
+                        "calibration: emergency graph restore failed")
+            if lock_held:
+                self._calibration_lock.release()
+
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
@@ -1262,25 +1530,50 @@ async def _main():
     )
     log.info("starting audiomux-syncd (pid %d)", os.getpid())
 
+    # Single-instance check FIRST. Killing orphan loopbacks before
+    # confirming we're the only daemon would let an accidental second
+    # instance disrupt the running one's audio path before exiting.
+    _probe_single_instance()
+
+    # Migration: kill stray pw-loopbacks from a crashed previous daemon, and
+    # unload any Phase-1 module-combine-sink that's still hanging around.
+    _kill_orphan_loopbacks(owned_pids=())
+    for mid in _live_combine_sink_module_ids():
+        log.info("migration: unloading phase-1 combine-sink id=%d", mid)
+        pactl("unload-module", str(mid))
+
+    # Phase-1 also wrote Props.latencyOffsetNsec on hardware sink nodes.
+    # That value is a hint to latency-aware apps (browser AV sync etc.)
+    # and silently survives daemon restarts; without this sweep an
+    # upgraded system keeps the old skew until the user re-calibrates.
+    try:
+        dump = _pw_dump()
+        with pulsectl.Pulse("audiomux-syncd-migrate-nsec") as pulse:
+            for s in pulse.sink_list():
+                if s.name == VIRTUAL_SINK_NAME or "monitor" in s.name:
+                    continue
+                node_id = _find_sink_node_id(s.name, dump)
+                if node_id is not None:
+                    _pw_clear_latency_offset(node_id)
+    except Exception:
+        log.exception("migration: failed to clear stale latencyOffsetNsec")
+
     graph = GraphManager()
-    measurer = SyncMeasurer(graph)
+    measurer = DriftMonitor(graph)
     graph._sync_measurer = measurer
 
-    # Initial setup: establish virtual sink and loopbacks from saved state.
-    # On a fresh start with no state, bootstrap with the primary or default sink.
     try:
         saved_sinks = graph._saved.get("active_sinks")
         if saved_sinks:
-            graph._set_active_sinks_inner(saved_sinks)
+            graph.set_active_sinks(saved_sinks, pin_default=False)
         else:
-            # No saved state — bootstrap with PRIMARY_SINK or current default
             with pulsectl.Pulse("audiomux-syncd-bootstrap") as pulse:
                 server = pulse.server_info()
                 boot_sink = PRIMARY_SINK if any(
                     s.name == PRIMARY_SINK for s in pulse.sink_list()
                 ) else server.default_sink_name
             log.info("no saved state, bootstrapping with %s", boot_sink)
-            graph._set_active_sinks_inner([boot_sink])
+            graph.set_active_sinks([boot_sink], pin_default=False)
     except Exception:
         log.exception("initial setup failed")
 
@@ -1299,7 +1592,6 @@ async def _main():
     def _handle_signal():
         log.info("received shutdown signal")
         stop_event.set()
-        # Schedule a hard exit in case graceful shutdown hangs
         def _force_exit():
             import time as _time
             _time.sleep(5)
@@ -1315,8 +1607,6 @@ async def _main():
     reconcile_task = asyncio.create_task(
         _periodic_reconcile(graph, state_writer))
     measurer_task = asyncio.create_task(measurer.run())
-    offset_flush_task = asyncio.create_task(
-        _offset_flush_loop(graph))
 
     await stop_event.wait()
 
@@ -1325,7 +1615,6 @@ async def _main():
     writer_task.cancel()
     reconcile_task.cancel()
     measurer_task.cancel()
-    offset_flush_task.cancel()
     await monitor.stop()
     await socket_server.stop()
     graph.shutdown()
@@ -1339,18 +1628,7 @@ def _reconcile_and_notify(graph, state_writer):
         log.exception("reconciliation failed")
 
 
-async def _offset_flush_loop(graph):
-    """Check for pending offset rebuilds every 200ms."""
-    while True:
-        await asyncio.sleep(0.2)
-        try:
-            graph.flush_pending_offset_rebuilds()
-        except Exception:
-            log.exception("offset flush failed")
-
-
 async def _periodic_reconcile(graph, state_writer):
-    """Full reconciliation sweep as fallback for missed pw-dump events."""
     while True:
         await asyncio.sleep(RECONCILE_INTERVAL)
         try:

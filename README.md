@@ -33,7 +33,7 @@ plasmoid/
 ## Requirements
 
 - KDE Plasma 6 / PipeWire
-- Python 3 + `pulsectl` (`pip install --user pulsectl`)
+- Python 3 + `pulsectl` and `numpy` (`pip install --user pulsectl numpy`)
 - `pactl` (part of `pipewire-pulse`)
 
 ## Installation

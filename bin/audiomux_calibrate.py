@@ -1,280 +1,277 @@
 #!/usr/bin/env python3
 """
-audiomux_calibrate — acoustic delay measurement via sink-monitor reference
+audiomux_calibrate — Phase 2 calibrator (GCC-PHAT, sequential per sink)
 
-Single mic session. For each sink sequentially:
-  - Record sink.monitor + mic simultaneously (already running)
-  - Play chirps through that sink
-  - Cross-correlate monitor vs mic → acoustic delay
+Invoked as an isolated subprocess by audiomux-syncd's `check-sync` command.
+For each active sink, plays one logarithmic sine sweep directly to that sink
+(via `paplay --device`, bypassing the combine), captures the mic and the
+sink's `.monitor` simultaneously, and computes the acoustic delay by
+GCC-PHAT cross-correlating mic vs. monitor.
 
-Usage: audiomux_calibrate.py <mic_device> <sink1> [sink2] ...
+Why sequential rather than one combined sweep: when the sweep fans out to
+every sink simultaneously, the loudest
+speaker dominates the mic's capture. Because combine-sink feeds all backend
+monitors with a single time-aligned stream, GCC-PHAT of mic vs. *any*
+monitor locks onto the loudest-speaker peak — so every sink reports the
+same (wrong) delay. Integration test on 2026-04-14 produced analog=19.8 ms
+and BT=9.2 ms, which is clearly the analog peak leaking into BT's cross-
+correlation. Playing to one sink at a time eliminates the crosstalk and
+still costs only ~2 s per sink — well under the 5 s budget.
+
+This also replaces the 0.2.0 approach of per-sink sequential paplay +
+Goertzel energy detection, which suffered from ~85 ms jitter caused by
+variable PipeWire startup latency. That problem
+is solved here because GCC-PHAT measures mic-vs-monitor *relative* timing,
+not absolute emit time — whatever PipeWire's per-invocation startup
+latency is, both captures see the same sweep at the same sample offsets
+within their own streams.
+
+Argv protocol (daemon-compatible):
+    audiomux_calibrate.py <mic_source> <sink_1> [<sink_2> ...]
+Stdin:
+    Ignored.
+Stdout (single JSON line):
+    {"ok": true, "method": "gcc-phat-sequential",
+     "rounds": [{<sink>: {"delay_ms": N, "confidence": 0..1, "freq": 0,
+                          "peak_ratio": N}, ...}]}
 """
 
+from __future__ import annotations
+
+import contextlib
 import json
-import math
 import os
-import random
-import signal
-import struct
 import subprocess
 import sys
-import threading
+import tempfile
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import numpy as np
+except ImportError:
+    print(json.dumps({
+        "ok": False,
+        "error": ("numpy is required for Phase 2 calibration — install with "
+                  "`python3 -m pip install --user numpy`"),
+    }))
+    sys.exit(0)
 
-RATE = 48000
-CHANNELS = 2
-S16_FRAME = CHANNELS * 2
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+from audiomux_sync_lib import (
+    gcc_phat,
+    gen_log_sweep,
+    float_mono_to_s16_stereo_bytes,
+    raw_s16le_stereo_to_mono,
+)
 
-WARMUP = 0.5       # dither warmup per sink
-CHIRP_DURATION = 0.2
-CHIRP_F0 = 800
-CHIRP_F1 = 6000
-CHIRP_AMPLITUDE = 0.7
-CHIRP_GAP = 0.3    # gap between chirps
-TAIL = 0.8
-DITHER_AMPLITUDE = 0.02
-N_CHIRPS = 3
+# ── parameters ───────────────────────────────────────────────────────────────
 
-
-def _generate_chirp():
-    n = int(CHIRP_DURATION * RATE)
-    samples = []
-    for i in range(n):
-        t = i / RATE
-        freq = CHIRP_F0 + (CHIRP_F1 - CHIRP_F0) * t / CHIRP_DURATION
-        phase = 2 * math.pi * (CHIRP_F0 * t + 0.5 * (CHIRP_F1 - CHIRP_F0) * t * t / CHIRP_DURATION)
-        samples.append(CHIRP_AMPLITUDE * math.sin(phase))
-    return samples
-
-
-def _mono_to_raw(samples):
-    raw = bytearray()
-    for s in samples:
-        val = int(max(-1.0, min(1.0, s)) * 32767)
-        raw += struct.pack("<hh", val, val)
-    return bytes(raw)
-
-
-def _raw_to_mono(raw_bytes):
-    samples = []
-    for i in range(0, len(raw_bytes) - S16_FRAME + 1, S16_FRAME):
-        l, r = struct.unpack_from("<hh", raw_bytes, i)
-        samples.append((l + r) / 2.0)
-    return samples
+RATE         = 48000
+SWEEP_SEC    = 1.0
+SWEEP_F0     = 80.0
+SWEEP_F1     = 8000.0
+SWEEP_AMP    = 0.55
+WARMUP_SEC   = 1.5    # silent pre-roll — keeps BT speakers awake, primes codec
+PRE_SILENCE  = 0.15   # additional silence directly before the sweep
+POST_SILENCE = 0.80   # generous tail so BT codec+radio delay lands in capture
+MAX_LAG_MS   = 1500   # large enough for pathological BT paths
+PAPLAY_TIMEOUT_MARGIN_S = 4.0
+REC_TERM_WAIT_S = 2.0
 
 
-def _downsample(samples, factor):
-    out = []
-    for i in range(0, len(samples) - factor + 1, factor):
-        out.append(sum(samples[i:i + factor]) / factor)
-    return out
+# ── process helpers ──────────────────────────────────────────────────────────
+
+def _start_parecord(device: str, out_path: str):
+    return subprocess.Popen(
+        ["parecord",
+         "--device", device,
+         "--rate", str(RATE),
+         "--channels", "2",
+         "--format", "s16le",
+         "--latency-msec", "20",
+         "--raw",
+         out_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
 
 
-def _xcorr_lag(ref, mic):
-    """Cross-correlate the monitor and mic buffers, returning (lag_ms, confidence).
+def _stop(proc: subprocess.Popen):
+    if proc.poll() is None:
+        proc.terminate()
+    try:
+        _, err = proc.communicate(timeout=REC_TERM_WAIT_S)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        _, err = proc.communicate()
+    return err or b""
 
-    This intentionally differs from audiomux_sync_lib.xcorr_offset:
-    - `_xcorr_lag` downsamples with `DS=12` (4kHz) instead of 48 (1kHz) so
-      the chirp retains more high-frequency content during calibration.
-    - `_xcorr_lag` only searches non-negative lags up to `max_lag`, assuming
-      the mic hears the tone after the sink monitor rather than performing a
-      bidirectional search.
-    - `_xcorr_lag` returns `(lag_ms, confidence)` in milliseconds plus
-      normalized correlation, rather than original-rate sample offsets.
+
+def _play_sweep_to(sink: str, payload: bytes, budget_s: float):
+    """Play a stereo S16LE PCM blob directly to one hardware sink.
+
+    Using `paplay --raw` because `pw-cat` reads stdin via libsndfile, which
+    cannot parse unframed raw PCM.
     """
-    DS = 12  # 48000 → 4000Hz, Nyquist 2000Hz, keeps most of the chirp
-    ref_ds = _downsample(ref, DS)
-    mic_ds = _downsample(mic, DS)
-    ds_rate = RATE // DS
-    max_lag = int(1.0 * ds_rate)  # 1 second
-
-    n = min(len(ref_ds), len(mic_ds))
-    if n < 20:
-        return 0.0, 0.0
-
-    mean_r = sum(ref_ds[:n]) / n
-    mean_m = sum(mic_ds[:n]) / n
-    r = [x - mean_r for x in ref_ds[:n]]
-    m = [x - mean_m for x in mic_ds[:n]]
-    er = math.sqrt(sum(x * x for x in r))
-    em = math.sqrt(sum(x * x for x in m))
-    if er == 0 or em == 0:
-        return 0.0, 0.0
-
-    best_lag, best_corr = 0, -1.0
-    for lag in range(0, min(max_lag, n - 10)):
-        s = sum(a * b for a, b in zip(r[:n - lag], m[lag:n]))
-        c = s / (er * em)
-        if c > best_corr:
-            best_corr = c
-            best_lag = lag
-
-    return best_lag / ds_rate * 1000, best_corr
+    proc = subprocess.Popen(
+        ["paplay",
+         "--device", sink,
+         "--rate", str(RATE),
+         "--channels", "2",
+         "--format", "s16le",
+         "--raw"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        _, err = proc.communicate(input=payload, timeout=budget_s)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        _, err = proc.communicate()
+        return False, f"paplay timed out after {budget_s:.1f}s"
+    if proc.returncode != 0:
+        return False, (err.decode(errors="replace").strip()[:200]
+                       or f"paplay exited {proc.returncode}")
+    return True, ""
 
 
-class Recorder:
-    """Long-lived parecord process that accumulates raw audio."""
-    def __init__(self, device):
-        self.device = device
-        self._proc = None
-        self._raw = bytearray()
-        self._thread = None
-        self._stop = False
+# ── measurement ──────────────────────────────────────────────────────────────
 
-    def start(self):
-        cmd = [
-            "parecord", "--device", self.device,
-            "--rate", str(RATE), "--channels", str(CHANNELS),
-            "--format", "s16le", "--raw", "--latency-msec", "10",
-        ]
-        self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                      stderr=subprocess.DEVNULL)
-        self._thread = threading.Thread(target=self._read_loop, daemon=True)
-        self._thread.start()
+def _measure_sink(sink: str, mic: str, payload: bytes,
+                  warmup_payload: bytes, tmpdir: str,
+                  max_lag_samples: int):
+    """Run one sweep into `sink`, capture mic + sink.monitor, return delay.
 
-    def _read_loop(self):
-        while not self._stop:
-            chunk = self._proc.stdout.read(4096)
-            if not chunk:
-                break
-            self._raw.extend(chunk)
+    Plays a silent warmup first so BT sinks don't go idle between the
+    pre-roll and the sweep — a cold BT codec adds 60–200 ms of wake-up
+    latency that shifts GCC-PHAT's peak.
+    """
+    safe = sink.replace(":", "_").replace(".", "_")
+    mic_path = os.path.join(tmpdir, f"mic_{safe}.raw")
+    mon_path = os.path.join(tmpdir, f"mon_{safe}.raw")
 
-    def stop(self):
-        self._stop = True
-        if self._proc:
-            self._proc.terminate()
-            try:
-                self._proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self._proc.kill()
-                self._proc.wait()
-        if self._thread:
-            self._thread.join(timeout=2)
+    # 1. Warm the sink — play silent audio (no recording yet). This wakes
+    #    suspended BT links and primes codec buffers.
+    _play_sweep_to(sink, warmup_payload,
+                   WARMUP_SEC + PAPLAY_TIMEOUT_MARGIN_S)
 
-    def snapshot(self):
-        """Return current sample count (for marking positions)."""
-        return len(self._raw) // S16_FRAME
+    # 2. Start captures.
+    mic_proc = _start_parecord(mic, mic_path)
+    mon_proc = _start_parecord(f"{sink}.monitor", mon_path)
+    time.sleep(0.30)  # let parecord settle
 
-    def get_mono(self, start_sample=0, end_sample=None):
-        """Extract a slice as mono float samples."""
-        start_byte = start_sample * S16_FRAME
-        end_byte = end_sample * S16_FRAME if end_sample else len(self._raw)
-        return _raw_to_mono(bytes(self._raw[start_byte:end_byte]))
+    # 3. Play the sweep.
+    total_sec = PRE_SILENCE + SWEEP_SEC + POST_SILENCE
+    ok, err = _play_sweep_to(
+        sink, payload, total_sec + PAPLAY_TIMEOUT_MARGIN_S)
+
+    # 4. Post-roll so BT codec + radio delay lands in the capture.
+    time.sleep(0.30)
+
+    stop_errs = []
+    for p in (mic_proc, mon_proc):
+        e = _stop(p)
+        if e:
+            text = e.decode(errors="replace").strip()
+            if text:
+                stop_errs.append(text[:200])
+
+    if not ok:
+        return {"delay_ms": 0, "confidence": 0.0, "freq": 0,
+                "peak_ratio": 0.0, "error": err}
+
+    mic_sig = raw_s16le_stereo_to_mono(mic_path)
+    mon_sig = raw_s16le_stereo_to_mono(mon_path)
+    if mic_sig.size < RATE // 2:
+        return {"delay_ms": 0, "confidence": 0.0, "freq": 0,
+                "peak_ratio": 0.0,
+                "error": f"mic capture too short ({mic_sig.size} samples)"}
+    if mon_sig.size < RATE // 2:
+        return {"delay_ms": 0, "confidence": 0.0, "freq": 0,
+                "peak_ratio": 0.0,
+                "error": (f"monitor capture too short ({mon_sig.size} "
+                          "samples) — sink likely suspended or muted")}
+
+    n = min(mic_sig.size, mon_sig.size)
+    lag_samples, peak_ratio = gcc_phat(
+        mic_sig[:n], mon_sig[:n], max_lag_samples=max_lag_samples)
+    delay_ms = lag_samples / RATE * 1000.0
+    # Map (3, 53) → (0, 1) linearly; clip.
+    confidence = max(0.0, min(1.0, (peak_ratio - 3.0) / 50.0))
+
+    return {
+        "delay_ms": round(delay_ms, 1),
+        "confidence": round(confidence, 2),
+        "peak_ratio": round(peak_ratio, 1),
+        "freq": 0,
+    }
+
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+def _emit(obj):
+    print(json.dumps(obj))
+    sys.exit(0)
 
 
 def main():
     if len(sys.argv) < 3:
-        print(json.dumps({"error": "usage: calibrate <mic> <sink1> [sink2] ..."}))
-        sys.exit(1)
+        _emit({"ok": False,
+               "error": "usage: audiomux_calibrate.py <mic> <sink1> [sink2 ...]"})
 
-    mic_device = sys.argv[1]
-    sink_names = sys.argv[2:]
+    mic = sys.argv[1]
+    sinks = list(dict.fromkeys(sys.argv[2:]))
 
-    chirp_raw = _mono_to_raw(_generate_chirp())
+    with contextlib.suppress(OSError, EOFError):
+        sys.stdin.read()
 
-    # Dither for warmup
-    dither_n = int(WARMUP * RATE)
-    dither_raw = _mono_to_raw([DITHER_AMPLITUDE * (random.random() * 2 - 1)
-                               for _ in range(dither_n)])
+    sweep = gen_log_sweep(duration_s=SWEEP_SEC, f0=SWEEP_F0, f1=SWEEP_F1,
+                          rate=RATE, amplitude=SWEEP_AMP)
+    silence_pre  = np.zeros(int(PRE_SILENCE  * RATE), dtype=np.float32)
+    silence_post = np.zeros(int(POST_SILENCE * RATE), dtype=np.float32)
+    wave = np.concatenate([silence_pre, sweep, silence_post])
+    payload = float_mono_to_s16_stereo_bytes(wave)
 
-    # Start ONE mic recorder for the entire session
-    mic_rec = Recorder(mic_device)
-    mic_rec.start()
-    time.sleep(0.1)  # let it settle
+    # Warmup: a very quiet dithered signal. Pure zeros would look like
+    # silence to PipeWire's "was-corked" detection on some paths.
+    warmup = (np.random.RandomState(0)
+              .uniform(-1.0, 1.0, int(WARMUP_SEC * RATE))
+              .astype(np.float32) * 0.001)
+    warmup_payload = float_mono_to_s16_stereo_bytes(warmup)
+
+    max_lag_samples = int(RATE * MAX_LAG_MS / 1000)
+    debug_dir = os.environ.get("AUDIOMUX_CAL_DEBUG")
 
     results = {}
+    tmp_ctx = (tempfile.TemporaryDirectory(prefix="audiomux-cal-")
+               if not debug_dir else None)
+    if tmp_ctx is not None:
+        tmp = tmp_ctx.name
+    else:
+        os.makedirs(debug_dir, exist_ok=True)
+        tmp = debug_dir
+    try:
+        for sink in sinks:
+            results[sink] = _measure_sink(
+                sink, mic, payload, warmup_payload, tmp, max_lag_samples)
+    finally:
+        if tmp_ctx is not None:
+            tmp_ctx.cleanup()
 
-    for sink in sink_names:
-        # Start monitor recorder for this sink
-        mon_rec = Recorder(f"{sink}.monitor")
-        mon_rec.start()
-        time.sleep(0.05)
-
-        # Warm up sink with dither
-        _play_raw(sink, dither_raw)
-        time.sleep(0.05)
-
-        # Play chirps and record positions
-        measurements = []
-        for chirp_num in range(N_CHIRPS):
-            # Mark positions in both recordings
-            mon_start = mon_rec.snapshot()
-            mic_start = mic_rec.snapshot()
-
-            # Play chirp
-            _play_raw(sink, chirp_raw)
-
-            # Wait for acoustic propagation
-            time.sleep(TAIL)
-
-            # Grab the recorded segments
-            mon_seg = mon_rec.get_mono(mon_start)
-            mic_seg = mic_rec.get_mono(mic_start)
-
-            if len(mon_seg) > 100 and len(mic_seg) > 100:
-                lag_ms, confidence = _xcorr_lag(mon_seg, mic_seg)
-                measurements.append((lag_ms, confidence))
-            else:
-                measurements.append((0, 0))
-
-            time.sleep(CHIRP_GAP)
-
-        # Stop this sink's monitor
-        mon_rec.stop()
-
-        # Average good measurements
-        good = [(l, c) for l, c in measurements if c > 0.2 and l >= 0]
-        if good:
-            avg_lag = sum(l for l, _ in good) / len(good)
-            avg_conf = sum(c for _, c in good) / len(good)
-            results[sink] = {
-                "delay_ms": round(avg_lag, 1),
-                "confidence": round(avg_conf, 2),
-                "probes": len(good),
-                "raw": [{"delay_ms": round(l, 1), "confidence": round(c, 2)}
-                        for l, c in measurements],
-            }
-        else:
-            results[sink] = {
-                "delay_ms": 0, "confidence": 0, "probes": 0,
-                "error": "no signal detected",
-                "raw": [{"delay_ms": round(l, 1), "confidence": round(c, 2)}
-                        for l, c in measurements],
-            }
-
-    # Stop mic
-    mic_rec.stop()
-
-    tone_rounds = []
-    max_rounds = max((len(data.get("raw", [])) for data in results.values()), default=0)
-    for round_idx in range(max_rounds):
-        tone_round = {}
-        for sink, data in results.items():
-            raw_entries = data.get("raw", [])
-            if round_idx < len(raw_entries):
-                tone_round[sink] = raw_entries[round_idx]
-        tone_rounds.append(tone_round)
-
-    print(json.dumps({"ok": True, "rounds": tone_rounds}))
-
-
-def _play_raw(device, raw_data):
-    cmd = [
-        "paplay", "--device", device,
-        "--rate", str(RATE), "--channels", str(CHANNELS),
-        "--format", "s16le", "--raw",
-    ]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL)
-    proc.stdin.write(raw_data)
-    proc.stdin.close()
-    proc.wait()
+    _emit({
+        "ok": True,
+        "method": "gcc-phat-sequential",
+        "rounds": [results],
+        "debug_dir": tmp if debug_dir else None,
+    })
 
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
-    signal.signal(signal.SIGALRM, lambda *_: sys.exit(1))
-    signal.alarm(45)
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}))
+        sys.exit(0)
