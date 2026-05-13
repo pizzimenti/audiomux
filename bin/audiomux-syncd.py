@@ -810,10 +810,29 @@ class GraphManager:
             _pw_clear_latency_offset(node_id)
 
     def restore_after_calibration(self, sinks):
-        """Re-spawn loopbacks with whatever offsets are now in the file."""
+        """Re-spawn loopbacks with whatever offsets are now in the file.
+
+        Filter to sinks still present in the live graph — reconcile is
+        gated off while calibration is running, so a BT disconnect
+        during the window would otherwise leave audiomux_virtual
+        re-engaged with a stale active_sinks entry until the next
+        reconcile catches up.
+        """
+        with pulsectl.Pulse("audiomux-syncd-restore-cal") as pulse:
+            live_sinks = {
+                s.name for s in pulse.sink_list()
+                if s.name != VIRTUAL_SINK_NAME and "monitor" not in s.name
+            }
+        sinks = [s for s in sinks if s in live_sinks]
         self._saved["active_sinks"] = list(sinks)
         self._mark_dirty()
         self.flush_state()
+        if len(sinks) <= 1:
+            # Disengage: nothing left to multiplex.
+            with self._mutation_lock:
+                self._kill_all_loopbacks()
+                self._unload_null_sink()
+            return
         with self._mutation_lock:
             self._ensure_null_sink()
             self._ensure_loopbacks()
@@ -962,6 +981,14 @@ class DriftMonitor:
                     # accumulates inside a live loopback.
                     self._graph._kill_all_loopbacks()
                     self._graph._ensure_loopbacks()
+                # Wipe history so the next _compute_locked window starts
+                # fresh against the new loopbacks. Without this, the old
+                # post-drift samples keep the rolling median biased for
+                # ~half a window and _maybe_resync retriggers every few
+                # samples — flapping loopbacks audibly.
+                with self._lock:
+                    self._history.clear()
+                    self._exceed_count.clear()
             except Exception:
                 log.exception("resync attempt failed")
 
@@ -1162,7 +1189,13 @@ class SocketServer:
         self._calibration_in_progress = False
 
     async def start(self):
-        self._cleanup_stale_socket()
+        # _probe_single_instance in _main is the sole arbiter of whether
+        # SOCKET_PATH is safe to use; it either confirms no peer is alive
+        # and unlinks any stale file, or it sys.exits. Don't unlink here:
+        # a blind unlink would reopen a TOCTOU window where a concurrent
+        # daemon could rip out our live socket. If something other than
+        # the probe left a file in place, start_unix_server's EADDRINUSE
+        # is the correct failure mode.
         self._server = await asyncio.start_unix_server(
             self._handle_client, path=SOCKET_PATH)
         os.chmod(SOCKET_PATH, 0o600)
@@ -1172,15 +1205,6 @@ class SocketServer:
         if self._server:
             self._server.close()
             await self._server.wait_closed()
-        try:
-            os.unlink(SOCKET_PATH)
-        except FileNotFoundError:
-            pass
-
-    def _cleanup_stale_socket(self):
-        # _probe_single_instance in _main is the authoritative check
-        # and runs before we'd ever get here. Anything left at this
-        # point is a stale file we can safely remove.
         try:
             os.unlink(SOCKET_PATH)
         except FileNotFoundError:
@@ -1462,6 +1486,22 @@ async def _main():
     for mid in _live_combine_sink_module_ids():
         log.info("migration: unloading phase-1 combine-sink id=%d", mid)
         pactl("unload-module", str(mid))
+
+    # Phase-1 also wrote Props.latencyOffsetNsec on hardware sink nodes.
+    # That value is a hint to latency-aware apps (browser AV sync etc.)
+    # and silently survives daemon restarts; without this sweep an
+    # upgraded system keeps the old skew until the user re-calibrates.
+    try:
+        dump = _pw_dump()
+        with pulsectl.Pulse("audiomux-syncd-migrate-nsec") as pulse:
+            for s in pulse.sink_list():
+                if s.name == VIRTUAL_SINK_NAME or "monitor" in s.name:
+                    continue
+                node_id = _find_sink_node_id(s.name, dump)
+                if node_id is not None:
+                    _pw_clear_latency_offset(node_id)
+    except Exception:
+        log.exception("migration: failed to clear stale latencyOffsetNsec")
 
     graph = GraphManager()
     measurer = DriftMonitor(graph)
