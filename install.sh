@@ -209,10 +209,13 @@ else
     log "Audiomux applet already in panel config"
 fi
 
-# ── python dep ────────────────────────────────────────────────────────────────
+# ── python deps ───────────────────────────────────────────────────────────────
 
 if ! python3 -c "import pulsectl" 2>/dev/null; then
     log "pulsectl is missing — install with: python3 -m pip install --user pulsectl"
+fi
+if ! python3 -c "import numpy" 2>/dev/null; then
+    log "numpy is missing (required for Phase-2 calibration) — install with: python3 -m pip install --user numpy"
 fi
 
 # ── reload plasmashell ───────────────────────────────────────────────────────

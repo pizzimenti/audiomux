@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## 0.3.0 - Unreleased
+## 0.3.0 - 2026-05-13
 
 Sync-redesign cycle: replaces the brittle manual-delay model with
 acoustic calibration + passive drift monitoring, and stops the daemon
