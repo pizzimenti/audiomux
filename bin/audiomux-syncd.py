@@ -1187,6 +1187,12 @@ class SocketServer:
         self._measurer = measurer
         self._server = None
         self._calibration_in_progress = False
+        # Socket requests dispatch on executor threads, so two
+        # `check-sync` calls can land in _run_calibration concurrently
+        # — racing prepare/restore against the same graph and mic.
+        # A non-reentrant lock with try_acquire is the gate; the
+        # status flag stays as a publish-side hint.
+        self._calibration_lock = threading.Lock()
 
     async def start(self):
         # _probe_single_instance in _main is the sole arbiter of whether
@@ -1316,6 +1322,8 @@ class SocketServer:
 
     def _run_calibration(self):
         """Run the Phase-2 GCC-PHAT calibrator as an isolated subprocess."""
+        if not self._calibration_lock.acquire(blocking=False):
+            return {"ok": False, "error": "calibration already in progress"}
         self._calibration_in_progress = True
         self._graph._calibrating = True
         sinks = None
@@ -1429,7 +1437,14 @@ class SocketServer:
 
             good_results = {k: v for k, v in results.items()
                             if "error" not in v}
-            if good_results:
+            failed = [k for k, v in results.items() if "error" in v]
+            if good_results and not failed:
+                # All-or-nothing: blending fresh offsets for measured
+                # sinks with stale ones for failed sinks would skew
+                # the whole group since min_delay normalizes only the
+                # fresh set. Save offsets only when every sink in this
+                # run produced a usable reading; otherwise leave the
+                # file untouched and ask the user to retry.
                 min_delay = min(v["delay_ms"]
                                 for v in good_results.values())
                 offsets = load_offsets()
@@ -1441,6 +1456,11 @@ class SocketServer:
                          min_delay)
                 applied = {k: offsets.get(k, 0) for k in sinks}
                 log.info("calibration: offsets applied %s", applied)
+            elif good_results:
+                log.warning("calibration: partial measurement "
+                            "(%d/%d sinks failed: %s); offsets unchanged — "
+                            "re-run when the failing sinks stabilize",
+                            len(failed), len(results), failed)
             else:
                 log.warning("calibration: no usable readings")
 
@@ -1464,6 +1484,7 @@ class SocketServer:
                 except Exception:
                     log.exception(
                         "calibration: emergency graph restore failed")
+            self._calibration_lock.release()
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
