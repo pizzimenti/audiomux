@@ -650,7 +650,7 @@ class GraphManager:
 
     # ── command methods ──────────────────────────────────────────────────
 
-    def set_active_sinks(self, names):
+    def set_active_sinks(self, names, pin_default=True):
         with pulsectl.Pulse("audiomux-syncd-set-sinks") as pulse:
             sink_names = {
                 s.name for s in pulse.sink_list()
@@ -676,7 +676,11 @@ class GraphManager:
             with self._mutation_lock:
                 self._kill_all_loopbacks()
                 self._unload_null_sink()
-            if names:
+            # Only pin the system default when this came from a user
+            # action (applet click, unbond_all). Bootstrap passes
+            # pin_default=False so it doesn't clobber the autoswitch
+            # priority WirePlumber would otherwise pick.
+            if names and pin_default:
                 pactl("set-default-sink", names[0])
         else:
             with self._mutation_lock:
@@ -1386,7 +1390,7 @@ async def _main():
     try:
         saved_sinks = graph._saved.get("active_sinks")
         if saved_sinks:
-            graph.set_active_sinks(saved_sinks)
+            graph.set_active_sinks(saved_sinks, pin_default=False)
         else:
             with pulsectl.Pulse("audiomux-syncd-bootstrap") as pulse:
                 server = pulse.server_info()
@@ -1394,7 +1398,7 @@ async def _main():
                     s.name == PRIMARY_SINK for s in pulse.sink_list()
                 ) else server.default_sink_name
             log.info("no saved state, bootstrapping with %s", boot_sink)
-            graph.set_active_sinks([boot_sink])
+            graph.set_active_sinks([boot_sink], pin_default=False)
     except Exception:
         log.exception("initial setup failed")
 
