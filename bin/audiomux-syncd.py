@@ -835,6 +835,12 @@ class GraphManager:
         self._saved["active_sinks"] = list(sinks)
         self._mark_dirty()
         self.flush_state()
+        # Refresh master immediately: if the prior master disappeared
+        # during the calibration window, DriftMonitor would otherwise
+        # keep using it as the reference until the next reconcile
+        # (up to RECONCILE_INTERVAL), misclassifying healthy followers
+        # as degraded and risking spurious loopback restarts.
+        self._master_sink = self._resolve_master(set(sinks))
         if len(sinks) <= 1:
             # Disengage: nothing left to multiplex.
             with self._mutation_lock:
