@@ -1322,7 +1322,8 @@ class SocketServer:
 
     def _run_calibration(self):
         """Run the Phase-2 GCC-PHAT calibrator as an isolated subprocess."""
-        if not self._calibration_lock.acquire(blocking=False):
+        lock_held = self._calibration_lock.acquire(blocking=False)
+        if not lock_held:
             return {"ok": False, "error": "calibration already in progress"}
         self._calibration_in_progress = True
         self._graph._calibrating = True
@@ -1484,7 +1485,8 @@ class SocketServer:
                 except Exception:
                     log.exception(
                         "calibration: emergency graph restore failed")
-            self._calibration_lock.release()
+            if lock_held:
+                self._calibration_lock.release()
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
