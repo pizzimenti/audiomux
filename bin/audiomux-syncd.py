@@ -48,6 +48,8 @@ from audiomux_sync_lib import (
 
 # ── constants ────────────────────────────────────────────────────────────────
 
+DAEMON_VERSION      = "0.3.0"
+
 PRIMARY_SINK        = "alsa_output.pci-0000_03_00.6.analog-stereo"
 PRIMARY_SOURCE      = "alsa_input.pci-0000_03_00.6.analog-stereo"
 VIRTUAL_SINK_NAME   = "audiomux_virtual"
@@ -639,6 +641,7 @@ class GraphManager:
             "wireplumber.service", "ActiveEnterTimestamp")
 
         return {
+            "daemon_version": DAEMON_VERSION,
             "sinks": sinks,
             "sources": sources,
             "master_sink": master,

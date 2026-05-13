@@ -38,8 +38,9 @@ from fighting WirePlumber over the system default sink.
   second sink is checked in the applet.
 - Reconcile defers null-sink creation until after deciding to engage,
   avoiding a load + immediate teardown when the active set is small.
-- Bumped daemon version in published state JSON so the plasmoid can
-  surface a "please update" hint if versions diverge.
+- Bumped daemon and plasmoid version to 0.3.0; daemon now publishes
+  `daemon_version` in its state JSON so a future plasmoid can compare
+  against its own version and surface a "please update" hint.
 
 ### Fixed
 
