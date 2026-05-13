@@ -241,10 +241,12 @@ def _probe_single_instance():
 
 def _kill_orphan_loopbacks(owned_pids=()):
     """Terminate stray `pw-loopback` processes we don't own — e.g. leftovers
-    from a crashed previous daemon."""
+    from a crashed previous daemon. Scoped to the current user so we
+    never touch another user's session on a shared box."""
     try:
         result = subprocess.run(
-            ["pgrep", "-af", f"pw-loopback.*{LOOPBACK_NAME_PREFIX}"],
+            ["pgrep", "-af", "-u", str(_UID),
+             f"pw-loopback.*{LOOPBACK_NAME_PREFIX}"],
             capture_output=True, text=True,
         )
     except FileNotFoundError:
@@ -262,6 +264,12 @@ def _kill_orphan_loopbacks(owned_pids=()):
             log.info("migration: killed orphan pw-loopback pid=%d", pid)
         except ProcessLookupError:
             pass
+        except PermissionError:
+            # Belt-and-suspenders: -u $UID above should already exclude
+            # other users' processes, but a misconfigured pgrep build or
+            # a setuid'd descendant could still leak through. Skip
+            # rather than abort daemon startup.
+            log.info("migration: skip pw-loopback pid=%d (not ours)", pid)
 
 
 # ── GraphManager ─────────────────────────────────────────────────────────────
