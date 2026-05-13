@@ -5,7 +5,7 @@ audiomux-syncd — AudioMux sync daemon
 Long-running service that owns the PipeWire routing graph and exposes
 state to the plasmoid via a runtime JSON file and a Unix domain socket.
 
-Graph shape (post-Phase-1-revert, see REDESIGN.md §9 addendum):
+Graph shape (post-Phase-1-revert):
 
   * One `module-null-sink` named `audiomux_virtual` — the virtual sink
     the rest of the system treats as default. This is the 0.2.0 shape,
@@ -213,6 +213,30 @@ def _pw_clear_latency_offset(node_id):
          "{ latencyOffsetNsec = 0 }"],
         capture_output=True, text=True,
     )
+
+
+def _probe_single_instance():
+    """Refuse to start if another daemon already owns SOCKET_PATH.
+
+    Has to run BEFORE _kill_orphan_loopbacks, otherwise an accidental
+    second daemon would terminate the live instance's pw-loopback
+    children before discovering the socket is in use and exiting.
+    """
+    if not os.path.exists(SOCKET_PATH):
+        return
+    import socket
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.connect(SOCKET_PATH)
+        log.error("another audiomux-syncd is already running")
+        sys.exit(1)
+    except ConnectionRefusedError:
+        log.info("removing stale socket %s", SOCKET_PATH)
+        os.unlink(SOCKET_PATH)
+    except FileNotFoundError:
+        pass
+    finally:
+        sock.close()
 
 
 def _kill_orphan_loopbacks(owned_pids=()):
@@ -789,7 +813,12 @@ class GraphManager:
     def shutdown(self):
         log.info("shutting down — killing %d loopbacks",
                  len(self._loopback_procs))
-        self._kill_all_loopbacks()
+        with self._mutation_lock:
+            self._kill_all_loopbacks()
+            # Unload audiomux_virtual too, otherwise it stays around as
+            # the default sink with nothing forwarding it to hardware
+            # and any new audio routes into a black hole.
+            self._unload_null_sink()
 
 
 # ── DriftMonitor ─────────────────────────────────────────────────────────────
@@ -917,6 +946,11 @@ class DriftMonitor:
             self._last_resync_ts = now
             try:
                 with self._graph._mutation_lock:
+                    # Force a real restart: _ensure_loopbacks alone only
+                    # respawns when the proc died or the configured delay
+                    # changed, neither of which is true when drift just
+                    # accumulates inside a live loopback.
+                    self._graph._kill_all_loopbacks()
                     self._graph._ensure_loopbacks()
             except Exception:
                 log.exception("resync attempt failed")
@@ -930,7 +964,22 @@ class DriftMonitor:
         sorted_ms = sorted(lat_ms)
         median = sorted_ms[len(sorted_ms) // 2]
         current = lat_ms[-1]
-        offset_ms = current - median
+        follower_dev = current - median
+
+        # When the master sink is also being monitored, drift only
+        # matters relative to it: a system-wide latency wobble that
+        # moves master and follower together isn't a sync problem,
+        # but the follower diverging from master is. Subtract the
+        # master's same-window deviation when available; fall back
+        # to the follower-only signal otherwise.
+        master_dev = 0.0
+        if master and master != sink_name:
+            m_hist = self._history.get(master)
+            if m_hist and len(m_hist) >= 2:
+                m_lat = [ns / 1_000_000.0 for _, ns in m_hist]
+                m_sorted = sorted(m_lat)
+                master_dev = m_lat[-1] - m_sorted[len(m_sorted) // 2]
+        offset_ms = follower_dev - master_dev
 
         jitter_ms = 0.0
         if len(lat_ms) > 1:
@@ -1119,21 +1168,13 @@ class SocketServer:
             pass
 
     def _cleanup_stale_socket(self):
-        if not os.path.exists(SOCKET_PATH):
-            return
-        import socket
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        # _probe_single_instance in _main is the authoritative check
+        # and runs before we'd ever get here. Anything left at this
+        # point is a stale file we can safely remove.
         try:
-            sock.connect(SOCKET_PATH)
-            log.error("another audiomux-syncd is already running")
-            sys.exit(1)
-        except ConnectionRefusedError:
-            log.info("removing stale socket %s", SOCKET_PATH)
             os.unlink(SOCKET_PATH)
         except FileNotFoundError:
             pass
-        finally:
-            sock.close()
 
     async def _handle_client(self, reader, writer):
         try:
@@ -1251,7 +1292,12 @@ class SocketServer:
 
             with pulsectl.Pulse("audiomux-calibrate") as pulse:
                 mic = pulse.server_info().default_source_name
-            if not mic or "monitor" in mic:
+            # COMBINE_SOURCE_NAME is the synthetic mixed input we
+            # create when multiple sources are active. It's the
+            # default source in that case, so the prior monitor-only
+            # filter let it through; calibrating against it would
+            # measure a synthetic blend instead of a real mic.
+            if not mic or "monitor" in mic or mic == COMBINE_SOURCE_NAME:
                 return {"ok": False, "error": "no microphone found"}
 
             sinks = sorted(active)
@@ -1378,6 +1424,11 @@ async def _main():
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
     log.info("starting audiomux-syncd (pid %d)", os.getpid())
+
+    # Single-instance check FIRST. Killing orphan loopbacks before
+    # confirming we're the only daemon would let an accidental second
+    # instance disrupt the running one's audio path before exiting.
+    _probe_single_instance()
 
     # Migration: kill stray pw-loopbacks from a crashed previous daemon, and
     # unload any Phase-1 module-combine-sink that's still hanging around.

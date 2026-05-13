@@ -8,8 +8,8 @@ For each active sink, plays one logarithmic sine sweep directly to that sink
 sink's `.monitor` simultaneously, and computes the acoustic delay by
 GCC-PHAT cross-correlating mic vs. monitor.
 
-Why sequential rather than one combined sweep (as REDESIGN.md §3.2 first
-proposed): when the sweep fans out to every sink simultaneously, the loudest
+Why sequential rather than one combined sweep: when the sweep fans out to
+every sink simultaneously, the loudest
 speaker dominates the mic's capture. Because combine-sink feeds all backend
 monitors with a single time-aligned stream, GCC-PHAT of mic vs. *any*
 monitor locks onto the loudest-speaker peak — so every sink reports the
@@ -20,7 +20,7 @@ still costs only ~2 s per sink — well under the 5 s budget.
 
 This also replaces the 0.2.0 approach of per-sink sequential paplay +
 Goertzel energy detection, which suffered from ~85 ms jitter caused by
-variable PipeWire startup latency (REDESIGN.md Appendix A). That problem
+variable PipeWire startup latency. That problem
 is solved here because GCC-PHAT measures mic-vs-monitor *relative* timing,
 not absolute emit time — whatever PipeWire's per-invocation startup
 latency is, both captures see the same sweep at the same sample offsets
@@ -38,6 +38,7 @@ Stdout (single JSON line):
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -224,10 +225,8 @@ def main():
     mic = sys.argv[1]
     sinks = list(dict.fromkeys(sys.argv[2:]))
 
-    try:
+    with contextlib.suppress(OSError, EOFError):
         sys.stdin.read()
-    except Exception:
-        pass
 
     sweep = gen_log_sweep(duration_s=SWEEP_SEC, f0=SWEEP_F0, f1=SWEEP_F1,
                           rate=RATE, amplitude=SWEEP_AMP)
