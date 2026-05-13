@@ -501,12 +501,18 @@ class GraphManager:
         # watching BT speakers connect / disconnect during beta testing.
         if self._known_sinks:
             new_sinks = sink_names - self._known_sinks
+            gone_sinks = self._known_sinks - sink_names
             for sn in sorted(new_sinks):
                 log.info("hotplug: new sink appeared: %s", sn)
-            if new_sinks:
-                self._last_hotplug_at = time.time()
-            for sn in sorted(self._known_sinks - sink_names):
+            for sn in sorted(gone_sinks):
                 log.info("hotplug: sink disappeared: %s", sn)
+            # Stamp on EITHER side of the transition: WirePlumber pulls
+            # the default away from audiomux_virtual on disconnect too,
+            # and without the stamp the reconcile path would read that
+            # as a user-initiated switch and disengage AudioMux mid-
+            # disconnect/reconnect churn.
+            if new_sinks or gone_sinks:
+                self._last_hotplug_at = time.time()
         if self._known_sources:
             for sn in sorted(source_names - self._known_sources):
                 log.info("hotplug: new source appeared: %s", sn)
@@ -758,9 +764,13 @@ class GraphManager:
         # Delay changes are relative — any one offset change can shift
         # every sink's --delay, so let _ensure_loopbacks sort out which
         # procs actually need respawning (it compares against the last
-        # known delay per sink).
-        with self._mutation_lock:
-            self._ensure_loopbacks()
+        # known delay per sink). Skip entirely when disengaged: with ≤1
+        # active sink, audiomux_virtual has been unloaded, and spawning
+        # a pw-loopback against a missing capture sink would just fail.
+        active = self._saved.get("active_sinks") or []
+        if len(active) > 1:
+            with self._mutation_lock:
+                self._ensure_loopbacks()
 
     def set_source_offset(self, name, offset_ms):
         offsets = load_offsets()
@@ -1284,6 +1294,8 @@ class SocketServer:
         """Run the Phase-2 GCC-PHAT calibrator as an isolated subprocess."""
         self._calibration_in_progress = True
         self._graph._calibrating = True
+        sinks = None
+        restored = False
         try:
             active = list(self._graph.active_sinks())
             if len(active) < 2:
@@ -1351,6 +1363,7 @@ class SocketServer:
             if cal_error:
                 log.info("calibration: restoring graph after error")
                 self._graph.restore_after_calibration(sinks)
+                restored = True
                 self._graph.invalidate_state_cache()
                 self._state_writer.notify()
                 return {"ok": False, "error": cal_error}
@@ -1408,12 +1421,25 @@ class SocketServer:
                 log.warning("calibration: no usable readings")
 
             self._graph.restore_after_calibration(sinks)
+            restored = True
             self._graph.invalidate_state_cache()
             self._state_writer.notify()
             return {"ok": True, "mic": mic, "results": results}
         finally:
             self._calibration_in_progress = False
             self._graph._calibrating = False
+            # If we tore down loopbacks for calibration and an
+            # unexpected exception unwound past both restore points
+            # (result-processing crash, save_offsets failure, etc.),
+            # the graph would be stuck torn down with audiomux_virtual
+            # still loaded and nothing forwarding audio. Guarantee
+            # restoration here.
+            if not restored and sinks:
+                try:
+                    self._graph.restore_after_calibration(sinks)
+                except Exception:
+                    log.exception(
+                        "calibration: emergency graph restore failed")
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
