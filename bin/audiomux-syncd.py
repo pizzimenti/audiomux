@@ -1439,6 +1439,7 @@ class SocketServer:
             good_results = {k: v for k, v in results.items()
                             if "error" not in v}
             failed = [k for k, v in results.items() if "error" in v]
+            offsets_applied = False
             if good_results and not failed:
                 # All-or-nothing: blending fresh offsets for measured
                 # sinks with stale ones for failed sinks would skew
@@ -1453,6 +1454,7 @@ class SocketServer:
                     offsets[sn] = max(0, round(
                         data["delay_ms"] - min_delay))
                 save_offsets(offsets)
+                offsets_applied = True
                 log.info("calibration: normalized (min=%.1fms subtracted)",
                          min_delay)
                 applied = {k: offsets.get(k, 0) for k in sinks}
@@ -1469,6 +1471,22 @@ class SocketServer:
             restored = True
             self._graph.invalidate_state_cache()
             self._state_writer.notify()
+            # When offsets weren't written (no good readings, or partial
+            # failure under the all-or-nothing rule), surface that via
+            # ok=false. The plasmoid's success path treats per-sink
+            # non-error entries as applied, so a silent ok=true here
+            # would leave the user thinking calibration succeeded while
+            # the offsets are actually stale.
+            if not offsets_applied:
+                if failed and good_results:
+                    err = (f"partial measurement ({len(failed)}/"
+                           f"{len(results)} sinks failed: "
+                           f"{', '.join(failed)}); offsets unchanged — "
+                           "re-run when the failing sinks stabilize")
+                else:
+                    err = "no usable readings; offsets unchanged"
+                return {"ok": False, "mic": mic,
+                        "results": results, "error": err}
             return {"ok": True, "mic": mic, "results": results}
         finally:
             self._calibration_in_progress = False
